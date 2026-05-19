@@ -580,71 +580,85 @@ def parse_episode_page(url: str) -> dict:
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
-def upsert_genres(db: Client, genres: list[str]) -> dict[str, str]:
-    if not genres:
-        return {}
-    id_map: dict[str, str] = {}
-    for name in genres:
-        try:
-            res = db.table("genres").upsert({"name": name}, on_conflict="name").execute()
-            if res.data:
-                id_map[name] = res.data[0]["id"]
-        except Exception as e:
-            log.warning(f"upsert_genre error {name}: {e}")
-    return id_map
+def get_or_create_genre(db: Client, name: str) -> Optional[str]:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    try:
+        res = db.table("genres").select("id").eq("slug", slug).execute()
+        if res.data:
+            return res.data[0]["id"]
+        ins = db.table("genres").insert({"name": name, "slug": slug}).execute()
+        return ins.data[0]["id"]
+    except Exception as e:
+        log.warning(f"Genre '{name}': {e}")
+        return None
 
 
-def link_content_genres(db: Client, content_id: str, genre_ids: list[str]):
-    for gid in genre_ids:
-        try:
-            db.table("content_genres").upsert(
-                {"content_id": content_id, "genre_id": gid},
-                on_conflict="content_id,genre_id"
-            ).execute()
-        except Exception as e:
-            log.warning(f"link_content_genres error: {e}")
+def find_content_by_title(db: Client, title: str) -> Optional[dict]:
+    try:
+        res = db.table("content").select(
+            "id, title, poster_url, thumbnail_url, banner_url, description, release_year, language, status"
+        ).eq("title", title).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        log.warning(f"find_content error: {e}")
+        return None
 
 
 def upsert_content(db: Client, data: dict) -> Optional[str]:
-    slug = data.get("_slug", "")
-    genres = data.get("_genres", [])
-    source_url = data.get("_source_url", "")
-    row = {k: v for k, v in data.items() if not k.startswith("_")}
-    row["source_url"] = source_url
+    genres    = data.pop("_genres", [])
+    data.pop("_languages", None)
+    data.pop("_episodes", None)
+    data.pop("_source_url", None)
+    data.pop("_slug", None)
+
+    title = data.get("title", "?")
+    existing = find_content_by_title(db, title)
+
     try:
-        existing = db.table("content").select("id, title, description, release_year, language, status").eq("source_url", source_url).execute()
-        if existing.data:
-            content_id = existing.data[0]["id"]
+        if existing:
+            content_id = existing["id"]
             updates = {}
-            for field in ("title", "description", "release_year", "language", "status", "poster_url", "banner_url", "thumbnail_url", "rating"):
-                new_val = row.get(field)
-                old_val = existing.data[0].get(field)
-                if new_val and new_val != old_val:
-                    updates[field] = new_val
+            for field in ("poster_url", "banner_url", "thumbnail_url"):
+                new_val = data.get(field)
+                old_val = existing.get(field)
+                if new_val and not is_logo(new_val):
+                    if not old_val or is_logo(old_val) or old_val != new_val:
+                        updates[field] = new_val
+            for field in ("description", "release_year", "language", "status"):
+                if data.get(field) and not existing.get(field):
+                    updates[field] = data[field]
             if updates:
                 db.table("content").update(updates).eq("id", content_id).execute()
                 STATS.content_updated += 1
-                con_upd(f"[UPDATED] {row.get('title', slug)} — {', '.join(updates.keys())}", indent=1)
+                con_upd(f"[UPDATED] {title} — {', '.join(updates.keys())}", indent=1)
             else:
                 STATS.content_skipped += 1
-                con_skip(f"[SKIP] {row.get('title', slug)}", indent=1)
-            if genres:
-                genre_map = upsert_genres(db, genres)
-                link_content_genres(db, content_id, list(genre_map.values()))
-            return content_id
+                con_skip(f"[SKIP] {title} — already complete", indent=1)
         else:
-            res = db.table("content").insert(row).execute()
+            res = db.table("content").insert(data).execute()
             content_id = res.data[0]["id"]
             STATS.content_new += 1
-            con_new(f"[NEW] {row.get('title', slug)}", indent=1)
-            if genres:
-                genre_map = upsert_genres(db, genres)
-                link_content_genres(db, content_id, list(genre_map.values()))
-            return content_id
+            thumb_ok = "🖼" if data.get("thumbnail_url") and not is_logo(data.get("thumbnail_url", "")) else "❌"
+            poster_ok = "🖼" if data.get("poster_url") and not is_logo(data.get("poster_url", "")) else "❌"
+            con_new(f"[NEW] {title} | thumb:{thumb_ok} poster:{poster_ok} | {data.get('type','?')} {data.get('release_year','')}".strip(), indent=1)
+
+        # Link genres
+        for g_name in genres:
+            g_id = get_or_create_genre(db, g_name)
+            if g_id:
+                try:
+                    db.table("content_genres").upsert(
+                        {"content_id": content_id, "genre_id": g_id},
+                        on_conflict="content_id,genre_id"
+                    ).execute()
+                except Exception as e:
+                    log.warning(f"content_genres link error: {e}")
+
+        return content_id
     except Exception as e:
-        log.error(f"upsert_content error {slug}: {e}", exc_info=True)
+        log.error(f"upsert_content error '{title}': {e}", exc_info=True)
         STATS.errors += 1
-        con_err(f"DB error for {slug}: {e}", indent=1)
+        con_err(f"[ERROR] {title}: {e}", indent=1)
         return None
 
 
