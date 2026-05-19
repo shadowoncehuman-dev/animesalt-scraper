@@ -1,100 +1,123 @@
 #!/usr/bin/env python3
 """
 AnimeSalt Scraper — Render.com entry point
-Runs the scraper daemon in a background thread.
-Also starts a tiny HTTP server so Render's health check passes
-and UptimeRobot can ping it to prevent sleep.
+
+Architecture:
+  - Main thread  → HTTP health server (Render needs this to mark service healthy)
+  - Background thread → scraper daemon loop
+
+Render free services sleep after 15 min of no traffic.
+Point UptimeRobot at your Render URL every 5 min to keep it awake 24/7.
 """
 
 import os
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 
 PORT = int(os.environ.get("PORT", 10000))
+INTERVAL_HOURS = float(os.environ.get("SCRAPE_INTERVAL_HOURS", "6"))
 
-# ── tiny status tracker shared between threads ────────────────
+# ── Shared status (written by scraper thread, read by HTTP thread) ─────────────
 STATUS = {
     "cycle": 0,
-    "last_started": None,
-    "last_finished": None,
-    "last_error": None,
     "running": False,
+    "last_started": "not yet",
+    "last_finished": "not yet",
+    "last_error": "none",
 }
 
 
+# ── Health-check HTTP server ───────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = (
-            f"AnimeSalt Scraper — alive\n"
-            f"Cycle:         {STATUS['cycle']}\n"
-            f"Scraping now:  {STATUS['running']}\n"
-            f"Last started:  {STATUS['last_started'] or 'not yet'}\n"
-            f"Last finished: {STATUS['last_finished'] or 'not yet'}\n"
-            f"Last error:    {STATUS['last_error'] or 'none'}\n"
-            f"Server time:   {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+            "AnimeSalt Scraper — alive\n"
+            f"Cycle:           {STATUS['cycle']}\n"
+            f"Scraping now:    {STATUS['running']}\n"
+            f"Last started:    {STATUS['last_started']}\n"
+            f"Last finished:   {STATUS['last_finished']}\n"
+            f"Last error:      {STATUS['last_error']}\n"
+            f"Next interval:   every {INTERVAL_HOURS:.0f} hours\n"
+            f"Server time:     {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
         ).encode()
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
-        pass  # silence request logs
+    def log_message(self, *args):
+        pass  # silence access logs
 
 
-def run_http():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"[health] Listening on port {PORT}", flush=True)
-    server.serve_forever()
+# ── Scraper loop (runs in a background thread) ─────────────────────────────────
+def scraper_loop():
+    # Small delay so HTTP server is guaranteed to bind before first scrape output
+    time.sleep(2)
 
-
-def run_scraper_loop():
-    """Import and run the scraper pipeline in an infinite loop."""
-    # Import here so HTTP server starts before any scraper output
-    import pipeline
-
-    INTERVAL_HOURS = float(os.environ.get("SCRAPE_INTERVAL_HOURS", "6"))
+    import pipeline  # imported here so any import error doesn't kill HTTP server
 
     while True:
         STATUS["cycle"] += 1
         STATUS["running"] = True
-        STATUS["last_started"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        STATUS["last_error"] = None
+        STATUS["last_error"] = "none"
+        STATUS["last_started"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
         print(
-            f"\n{'='*60}\n  SCRAPER CYCLE #{STATUS['cycle']} — {STATUS['last_started']}\n{'='*60}",
+            f"\n{'='*60}\n"
+            f"  SCRAPER CYCLE #{STATUS['cycle']}  —  {STATUS['last_started']}\n"
+            f"{'='*60}",
             flush=True,
         )
 
         try:
-            pipeline.STATS = pipeline.Stats()   # reset stats each cycle
+            pipeline.STATS = pipeline.Stats()  # fresh stats each cycle
             pipeline.run()
-            STATUS["last_finished"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        except Exception as e:
-            STATUS["last_error"] = str(e)
-            print(f"[scraper] ERROR in cycle #{STATUS['cycle']}: {e}", flush=True)
+            STATUS["last_finished"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            STATUS["last_error"] = "none"
+
+        except SystemExit:
+            # pipeline.py calls sys.exit(0) on KeyboardInterrupt — catch it here
+            # so only the scraper cycle ends, not the whole process
+            STATUS["last_finished"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            STATUS["last_error"] = "cycle ended early (SystemExit)"
+
+        except Exception:
+            err = traceback.format_exc()
+            STATUS["last_error"] = err.strip().splitlines()[-1]
+            STATUS["last_finished"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            print(f"[scraper] ERROR in cycle #{STATUS['cycle']}:\n{err}", flush=True)
 
         STATUS["running"] = False
 
-        sleep_secs = INTERVAL_HOURS * 3600
-        wake_at = datetime.utcfromtimestamp(time.time() + sleep_secs)
+        wake_at = datetime.utcfromtimestamp(time.time() + INTERVAL_HOURS * 3600)
         print(
-            f"[scraper] Cycle #{STATUS['cycle']} done. "
-            f"Next run at {wake_at.strftime('%Y-%m-%d %H:%M:%S UTC')} "
+            f"[scraper] Cycle #{STATUS['cycle']} finished. "
+            f"Next run at {wake_at.strftime('%Y-%m-%d %H:%M UTC')} "
             f"({INTERVAL_HOURS:.0f} h)",
             flush=True,
         )
-        time.sleep(sleep_secs)
+        time.sleep(INTERVAL_HOURS * 3600)
 
 
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Start HTTP health server in background
-    t_http = threading.Thread(target=run_http, daemon=True)
-    t_http.start()
+    print(f"[main] Starting scraper service on port {PORT}", flush=True)
 
-    # Run scraper loop in main thread
-    run_scraper_loop()
+    # Start scraper in background thread (non-daemon so it survives HTTP crashes)
+    t = threading.Thread(target=scraper_loop, name="scraper", daemon=False)
+    t.start()
+
+    # Run HTTP server on main thread — Render marks the service healthy once this
+    # starts responding, which happens immediately (before the first scrape starts)
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        print(f"[main] HTTP health server ready at http://0.0.0.0:{PORT}", flush=True)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[main] Shutting down.", flush=True)
+        sys.exit(0)
