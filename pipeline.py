@@ -110,9 +110,13 @@ MAX_RETRIES    = 3
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
-# ── Logging (file only — console uses colored output above) ───────────────────
-_file_handler = logging.FileHandler("scraper/scraper.log", encoding="utf-8")
-_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+# ── Logging (file next to this script — works on any server) ──────────────────
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scraper.log")
+try:
+    _file_handler = logging.FileHandler(_log_path, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+except OSError:
+    _file_handler = logging.NullHandler()
 log = logging.getLogger("animesalt")
 log.setLevel(logging.DEBUG)
 log.addHandler(_file_handler)
