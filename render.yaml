@@ -7,8 +7,12 @@ services:
     plan: free
     envVars:
       - key: SUPABASE_URL
-        sync: false          # you paste this in Render dashboard
+        sync: false
       - key: SUPABASE_SERVICE_KEY
-        sync: false          # you paste this in Render dashboard
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
       - key: SCRAPE_INTERVAL_HOURS
-        value: "6"           # how many hours between full scrapes
+        value: "6"
