@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: animesalt-scraper
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    envVars:
+      - key: SUPABASE_URL
+        sync: false          # you paste this in Render dashboard
+      - key: SUPABASE_SERVICE_KEY
+        sync: false          # you paste this in Render dashboard
+      - key: SCRAPE_INTERVAL_HOURS
+        value: "6"           # how many hours between full scrapes
