@@ -1185,9 +1185,12 @@ def process_content(db: Client, url: str, content_type: str):
             upsert_video_servers(db, ep_id, ep_data.get("video_servers", []))
 
 
-def run():
-    con_head("AnimeSalt.ac → Supabase Scraper")
-    print(f"  {DIM}Log file: scraper/scraper.log{RESET}")
+def run(progress_hook=None, new_title_hook=None):
+    """
+    progress_hook(current, total, title, url, status) — called after each item.
+    new_title_hook(title, content_type, episodes)      — called when a new title is inserted.
+    """
+    con_head("Senpai TV — Content Scraper")
     print(f"  {DIM}Press Ctrl+C at any time to stop safely — progress is always saved{RESET}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -1258,27 +1261,50 @@ def run():
     movie_count  = sum(1 for _, ct in content_urls if ct == "movie")
     con_ok(f"TOTAL to scrape: {len(content_urls)} unique titles ({series_count} series · {movie_count} movies)")
 
+    # Notify dashboard of discovered totals
+    if progress_hook:
+        progress_hook(0, len(content_urls), "Discovery complete", "", "discovered")
+
     # Step 3: Scrape all content
     con_head(f"STEP 3 — Scraping {len(content_urls)} content pages")
     total = len(content_urls)
 
+    # Track new titles before/after for new_title_hook
+    _prev_new = STATS.content_new
+
     for i, (url, ct) in enumerate(content_urls, 1):
+        title = urlparse(url).path.strip("/").split("/")[-1].replace("-", " ").title()
         try:
-            slug = urlparse(url).path.strip("/").split("/")[-1]
-            con_progress(i, total, slug)
+            con_progress(i, total, title)
+            before_new = STATS.content_new
+            before_ep  = STATS.episodes_new
             process_content(db, url, ct)
-            # Print a newline after progress bar so content output appears below
             print()
+
+            # Detect newly added titles and call hook
+            if new_title_hook and STATS.content_new > before_new:
+                ep_count = STATS.episodes_new - before_ep
+                new_title_hook(title, ct, ep_count)
+
+            # Progress hook every 50 items or on last item
+            if progress_hook and (i % 50 == 0 or i == total):
+                status = "new" if STATS.content_new > _prev_new else "updated/skipped"
+                _prev_new = STATS.content_new
+                progress_hook(i, total, title, url, status)
+
         except KeyboardInterrupt:
             con_progress_done()
-            print(f"\n{YELLOW}{BOLD}  ⚠  Interrupted by user — progress is saved!{RESET}")
-            print(f"  {DIM}Run again to continue from where you left off.{RESET}\n")
+            print(f"\n{YELLOW}{BOLD}  ⚠  Interrupted — progress is saved!{RESET}\n")
+            if progress_hook:
+                progress_hook(i, total, title, url, "interrupted")
             STATS.report()
             sys.exit(0)
         except Exception as e:
             log.error(f"Error processing {url}: {e}", exc_info=True)
             STATS.errors += 1
             con_err(f"Error: {url}: {e}")
+            if progress_hook:
+                progress_hook(i, total, title, url, f"error: {e}")
             continue
 
     STATS.report()
