@@ -1059,7 +1059,7 @@ def run(progress_hook=None, new_title_hook=None):
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         con_err("SUPABASE_URL or SUPABASE_SERVICE_KEY not set!")
-        sys.exit(1)
+        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY not set — skipping cycle")
 
     db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     con_ok("Connected to Supabase")

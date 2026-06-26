@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
 Senpai TV — Content Scraper Service
-Single-file entry point for Render.com. No external imports beyond pipeline.py.
 Run: python main.py
 """
 
 import os, sys, io, re, json, threading, time, traceback
-import requests as _req
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 from collections import deque
 
-PORT           = int(os.environ.get("PORT", 10000))
+PORT           = int(os.environ.get("PORT", 5000))
 INTERVAL_HRS   = float(os.environ.get("SCRAPE_INTERVAL_HOURS", "6"))
-TG_TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT        = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -30,34 +26,19 @@ def _nowt() -> str:
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-# ─── Telegram ────────────────────────────────────────────────────────────────
-def _tg(text: str):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    try:
-        _req.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                  json={"chat_id": TG_CHAT, "text": text,
-                        "parse_mode": "HTML", "disable_web_page_preview": True},
-                  timeout=10)
-    except Exception:
-        pass
-
-def tg_start(cycle, t, e):
-    _tg(f"🟣 <b>Senpai TV</b> — Cycle <b>#{cycle}</b> started\n"
-        f"📚 DB: <b>{t:,}</b> titles · <b>{e:,}</b> episodes\n🔍 Discovering…")
-
-def tg_done(cycle, new, upd, skip, ep, srv, err, dur, nxt):
-    ok = "✅ Clean" if err == 0 else f"⚠️ {err} error(s)"
-    _tg(f"✅ <b>Senpai TV</b> — Cycle <b>#{cycle}</b> complete\n"
-        f"➕ New: <b>{new}</b>  ✏️ Updated: <b>{upd}</b>  ⏭️ Skipped: <b>{skip}</b>\n"
-        f"🎞️ Episodes: <b>{ep}</b>  🖥️ Servers: <b>{srv}</b>\n"
-        f"⏱️ {dur}  ❗ {ok}\n⏰ Next: {nxt}")
-
-def tg_new(title, ctype, eps):
-    _tg(f"{'🎬' if ctype=='movie' else '📺'} <b>New!</b> {title} ({ctype}, {eps} ep)")
-
-def tg_err(cycle, err):
-    _tg(f"❌ <b>Senpai TV</b> Cycle #{cycle} error\n<code>{str(err)[:300]}</code>")
+# ─── Telegram (via telegram_bot.py) ──────────────────────────────────────────
+try:
+    import telegram_bot as _tgbot
+    def tg_start(cycle, t, e):   _tgbot.notify_cycle_start(cycle, t, e)
+    def tg_done(cycle, new, upd, skip, ep, srv, err, dur, nxt):
+        _tgbot.notify_cycle_done(cycle, new, upd, skip, ep, srv, err, dur, nxt)
+    def tg_new(title, ctype, eps): _tgbot.notify_new_title(title, ctype, eps)
+    def tg_err(cycle, err):       _tgbot.notify_error(cycle, "scraper loop", str(err))
+except ImportError:
+    def tg_start(*a, **k): pass
+    def tg_done(*a, **k): pass
+    def tg_new(*a, **k): pass
+    def tg_err(*a, **k): pass
 
 # ─── Shared state ────────────────────────────────────────────────────────────
 STATE = {
@@ -513,16 +494,8 @@ def _scraper_loop():
 
         pipeline.STATS = pipeline.Stats()
 
-        # Telegram: start
-        try:
-            from supabase import create_client as _cc
-            _db = _cc(os.environ.get("SUPABASE_URL", ""),
-                       os.environ.get("SUPABASE_SERVICE_KEY", ""))
-            _c = _db.table("content").select("id", count="exact", head=True).execute()
-            _e = _db.table("episodes").select("id", count="exact", head=True).execute()
-            tg_start(cycle, _c.count or 0, _e.count or 0)
-        except Exception:
-            tg_start(cycle, 0, 0)
+        # Telegram: cycle started
+        tg_start(cycle, 0, 0)
 
         t0 = time.time()
 
