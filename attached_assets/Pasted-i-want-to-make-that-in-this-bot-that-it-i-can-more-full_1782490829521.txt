@@ -1,0 +1,389 @@
+i want to make that in this bot that it i can more fully manage on tg bot and can give every update on bot and admin can allow users which can users see the progress, My available anime to allowed users the bot works as a db seeing bot do not show him that this was a meta updater bot . user can see wy list of added animes, search and many more and he can see metadata of anime if he selected any anime if admin allowed user to watch anime so users can also see episodes lisdt and can watch vedio onbot when users select anime then episode then give user episode file and restrict users that it can not forward from from bo, and file will automatically auto delete from bot after the time which length was the episode . with thumbnail image attaced to response. when bots comes online or with any message which bot send to users give images from this attached api and make bot fully professional looking with best working and professiional and add it best loading and many more best you can do . for image which bot send with test get from these apis one is for gif one is for images
+Neko Images & Anime roleplaying GIFs
+and from second api Get waifu pictures from an archive of over 4000 images and multiple tags.
+after testing that everything working fine push all code to my github repo .
+API Endpoints
+Base URL
+
+https://nekos.best/api/:version
+Replace :version with one of the supported versions below.
+
+Versions
+Version
+Status
+v2
+Current & Maintained
+Important
+
+Before making any requests, please read the User-Agent documentation. All requests must include a properly formatted User-Agent header.
+
+Endpoints
+GET /endpoints
+Returns all available API categories and their associated file formats.
+
+Example
+https://nekos.best/api/v2/endpoints
+
+
+{
+  "neko": { "format": "png" },
+  "...": {},
+  "wink": { "format": "gif" }
+}
+TIP
+
+Use this endpoint to dynamically discover supported categories instead of hardcoding them.
+
+GET /:category
+Returns a random image or GIF from the specified category, including metadata.
+
+Query Parameters
+Name	Type	Required	Description
+amount	number	No	Number of results to return (1 ≤ X ≤ 20)
+Defaults to 1 if not specified.
+
+Example (single result)
+https://nekos.best/api/v2/neko
+
+
+{
+  "results": [
+    {
+      "artist_name": "John Doe",
+      "artist_href": "https://www.example.com/en/users/1234567",
+      "source_url": "https://www.example.com/en/artworks/1234567",
+      "url": "https://nekos.best/api/v2/neko/xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.png",
+      "dimensions": {
+        "width": 420,
+        "height": 690
+      }
+    }
+  ]
+}
+Example (multiple results)
+https://nekos.best/api/v2/hug?amount=2
+
+
+{
+  "results": [
+    {
+      "anime_name": "Generic Anime Name",
+      "url": "https://nekos.best/api/v2/hug/xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.gif",
+      "dimensions": {
+        "width": 420,
+        "height": 690
+      }
+    },
+    {
+      "anime_name": "Generic Anime Name",
+      "url": "https://nekos.best/api/v2/hug/xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.gif",
+      "dimensions": {
+        "width": 420,
+        "height": 690
+      }
+    }
+  ]
+}
+GET /search
+Search for images or GIFs using metadata such as artist names or source titles.
+
+Query Parameters
+Name	Type	Required	Description
+query	string	Yes	Search phrase
+type	enum	Yes	1 = images, 2 = GIFs
+category	string	No	Restrict results to a category
+amount	number	No	Number of results (1 ≤ X ≤ 20)
+Example (image search)
+https://nekos.best/api/v2/search?query=John&type=1
+
+
+{
+  "results": [
+    {
+      "artist_name": "John Doe",
+      "artist_href": "https://www.example.com/en/users/1234567",
+      "source_url": "https://www.example.com/en/artworks/1234567",
+      "url": "https://nekos.best/api/v2/neko/xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.png",
+      "dimensions": {
+        "width": 420,
+        "height": 690
+      }
+    }
+  ]
+}
+Example (GIF search with category)
+https://nekos.best/api/v2/search?query=Generic&type=2&category=pat&amount=2
+
+
+{
+  "results": [
+    {
+      "anime_name": "Generic Anime Name",
+      "url": "https://nekos.best/api/v2/hug/xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.gif",
+      "dimensions": {
+        "width": 420,
+        "height": 690
+      }
+    },
+    {
+      "anime_name": "Generic Anime Name",
+      "url": "https://nekos.best/api/v2/hug/xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.gif",
+      "dimensions": {
+        "width": 420,
+        "height": 690
+      }
+    }
+  ]
+}
+GET /:category/:filename.:format
+Retrieves a specific asset directly.
+
+Path Parameters
+Name	Description
+category	Category name
+filename	Asset filename (UUID)
+format	File format (png, gif)
+INFO
+
+Metadata for this endpoint is returned via URL-encoded HTTP response headers.
+
+Available headers:
+
+anime_name
+artist_name
+artist_href
+source_url
+Example
+https://nekos.best/api/v2/hug/xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.gif
+
+Response: Binary image or GIF data.
+API Reference
+Rate Limits
+Every response includes the following headers to help you track and respect rate limits:
+
+Header	Description
+x-rate-limit-limit	Duration of the current rate limit window (e.g. 1m)
+x-rate-limit-remaining	Remaining requests in the current window
+x-rate-limit-reset	ISO 8601 timestamp of when the current window resets
+Limits
+Endpoint	Limit
+/search	7 requests per 5 seconds
+/:category	200 requests per minute (per category)
+User-Agent
+All requests must include a User-Agent header. Please use the following format: APP_NAME (CONTACT_INFO).
+For example: NekoApp (https://example.com) or NekoApp (dev@example.com)
+
+Naming Guidelines:
+
+Be specific: Do not use generic names like "Discord Bot", "WhatsApp Bot", or "Telegram Bot". Your application must have a unique name.
+Avoid placeholders: Do not use strings like test, bot, or the example value above.
+No library defaults: Avoid using default library strings such as python-requests, okhttp, axios, node, or Go-http-client.
+Contact Information Options:
+The contact info does not have to be a traditional website. Any of the following are acceptable ways to provide identification:
+
+A direct contact email address.
+A project website or public repository URL (e.g., GitHub, GitLab).
+A bot invite link or discovery page.
+A listing URL (e.g., top.gg or similar directories).
+Spoofing and Impersonation:
+
+Do not spoof browser strings. The Mozilla/5.0 ... format is strictly reserved for real web browsers and Cloudflare-verified bots.
+Do not impersonate known crawlers like Googlebot or Bingbot.
+Failure to follow these guidelines and using generic, default, or spoofed values will likely result in your requests being blocked.
+
+Categories
+Categories define the type of content returned by the API. Each category maps to a fixed file format.
+
+Images
+husbando
+kitsune
+neko
+waifu
+GIFs
+angry
+baka
+bite
+bleh
+blowkiss
+blush
+bonk
+bored
+carry
+clap
+confused
+cry
+cuddle
+dance
+facepalm
+feed
+handhold
+handshake
+happy
+highfive
+hug
+kabedon
+kick
+kiss
+lappillow
+laugh
+lurk
+nod
+nom
+nope
+nya
+pat
+peck
+poke
+pout
+punch
+run
+salute
+shake
+shoot
+shocked
+shrug
+sip
+slap
+sleep
+smile
+smug
+spin
+stare
+tableflip
+teehee
+think
+thumbsup
+tickle
+wag
+wave
+wink
+yawn
+yeet
+Response Fields
+Type	Fields
+Images	artist_name, artist_href, source_url
+GIFs	anime_name
+url and dimensions are included in both.
+The simplest way to use the API is to fetch random images. No authentication is required for basic usage.
+
+Fetch a Random Image
+curl https://api.waifu.im/images
+
+This returns a JSON response with paginated image data:
+
+{
+  "items": [
+    {
+      "id": 6758,
+      "perceptualHash": "0000000000000000",
+      "extension": ".png",
+      "dominantColor": "#eee6eb",
+      "source": "https://www.pixiv.net/en/artworks/81300646",
+      "artists": [
+        {
+          "id": 838,
+          "name": "ネコサン＠お仕事募集中",
+          "patreon": null,
+          "pixiv": "https://www.pixiv.net/users/544561",
+          "twitter": "https://twitter.com/neko__san",
+          "deviantArt": null,
+          "reviewStatus": "Accepted",
+          "creatorId": null,
+          "imageCount": 0
+        }
+      ],
+      "uploaderId": null,
+      "uploadedAt": "2021-11-02T11:16:19.048684Z",
+      "isNsfw": false,
+      "isAnimated": false,
+      "width": 1600,
+      "height": 2088,
+      "byteSize": 1778623,
+      "url": "https://cdn.waifu.im/6758.png",
+      "tags": [
+        {
+          "id": 7,
+          "name": "Oppai",
+          "slug": "oppai",
+          "description": "Large-breasted women",
+          "reviewStatus": "Accepted",
+          "creatorId": null,
+          "imageCount": 0
+        }
+      ],
+      "reviewStatus": "Accepted",
+      "favorites": 20,
+      "likedAt": null,
+      "addedToAlbumAt": null,
+      "albums": []
+    }
+  ],
+  "pageNumber": 1,
+  "totalPages": 1,
+  "totalCount": 1,
+  "hasPreviousPage": false,
+  "hasNextPage": false,
+  "maxPageSize": -1,
+  "defaultPageSize": 1
+}
+
+Filter by Tags
+Include images matching specific tags using IncludedTags (AND logic -- all tags must match):
+
+curl "https://api.waifu.im/images?IncludedTags=waifu"
+
+Exclude images with certain tags using ExcludedTags (OR logic -- any match is excluded):
+
+curl "https://api.waifu.im/images?ExcludedTags=maid"
+
+Pagination
+Control pagination with Page and PageSize:
+
+curl "https://api.waifu.im/images?PageSize=10&Page=1"
+
+NSFW Content
+By default, only SFW images are returned (IsNsfw=False). The parameter accepts three values: False, True, and All.
+
+# NSFW images only
+curl "https://api.waifu.im/images?IsNsfw=True"
+
+# Both SFW and NSFW images
+curl "https://api.waifu.im/images?IsNsfw=All"
+
+See the Tags page for more details on how tags and NSFW filtering interact.
+
+Filter by Artist
+You can filter images by artist ID using IncludedArtists:
+
+curl "https://api.waifu.im/images?IncludedArtists=1"
+
+Consult the API Reference for the full list of available filters (orientation, resolution, file size, animation, and more).
+
+Available Tags
+To see all available tags:
+
+curl https://api.waifu.im/tags
+
+The me and favorites Aliases
+When authenticated, you can use me as a user ID alias to refer to yourself, and favorites as an album ID alias to refer to your default favorites album. These aliases simplify common operations:
+
+# Get your own profile
+curl -H "X-Api-Key: YOUR_API_KEY" https://api.waifu.im/users/me
+
+# List your favorites
+curl -H "X-Api-Key: YOUR_API_KEY" https://api.waifu.im/users/me/albums/favorites
+
+# Add an image to your favorites
+curl -X POST -H "X-Api-Key: YOUR_API_KEY" \
+  "https://api.waifu.im/users/me/albums/favorites/images/8008"
+
+# Remove an image from your favorites
+curl -X DELETE -H "X-Api-Key: YOUR_API_KEY" \
+  "https://api.waifu.im/users/me/albums/favorites/images/8008"
+
+Code Examples
+cURL
+JavaScript
+Python
+C#
+curl "https://api.waifu.im/images?IncludedTags=waifu"
