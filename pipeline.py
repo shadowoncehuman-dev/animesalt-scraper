@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 AnimeSalt.ac → Supabase Scraper Pipeline
+Fetches ALL anime, cartoons, movies from every category/network/language page.
 Run:  python3 pipeline.py
 Stop anytime with Ctrl+C — safe to resume; already-scraped content is skipped/updated.
 """
@@ -13,7 +14,7 @@ import random
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs, urlencode
 from typing import Optional
 
 import requests
@@ -97,7 +98,6 @@ LOGO_URLS      = {
 EXCLUDE_PATH_PATTERNS = [
     "AnimeSaltLong", "cropped-AnimeSalt",
     "sonyay", "sony-yay",
-    "nickelodeon", "disney", "cartoon-network", "pogo-",
 ]
 EXCLUDE_FILENAME_PATTERNS = [
     "favicon", "watermark",
@@ -138,7 +138,7 @@ def fetch(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
     for attempt in range(retries):
         try:
             time.sleep(random.uniform(*REQUEST_DELAY))
-            r = session.get(url, timeout=20)
+            r = session.get(url, timeout=25)
             if r.status_code == 200:
                 return r.text
             elif r.status_code == 404:
@@ -200,6 +200,24 @@ def extract_image(tag) -> Optional[str]:
     return None
 
 
+# ── URL classification ─────────────────────────────────────────────────────
+def classify_url(url: str) -> Optional[str]:
+    p = urlparse(url).path
+    if p.startswith("/series/"):
+        return "series"
+    if p.startswith("/movies/"):
+        return "movie"
+    if p.startswith("/episode/"):
+        return "episode"
+    return None
+
+
+def canonical_content_url(url: str) -> str:
+    """Strip query/fragment from content URLs for deduplication."""
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
 # ── Sitemap discovery ─────────────────────────────────────────────────────────
 def get_sitemap_urls(sitemap_url: str) -> list[str]:
     log.info(f"Fetching sitemap: {sitemap_url}")
@@ -221,19 +239,9 @@ def get_sitemap_urls(sitemap_url: str) -> list[str]:
     return [u.text.strip() for u in root.findall("sm:url/sm:loc", ns)]
 
 
-def classify_url(url: str) -> Optional[str]:
-    p = urlparse(url).path
-    if p.startswith("/series/"):
-        return "series"
-    if p.startswith("/movies/"):
-        return "movie"
-    if p.startswith("/episode/"):
-        return "episode"
-    return None
-
-
-# ── Category / pagination fallback ───────────────────────────────────────────
-CATEGORY_SEEDS = [
+# ── Category seed list ────────────────────────────────────────────────────────
+# Base category seeds — every entry is crawled once for series AND once with ?type=movies
+BASE_CATEGORY_SEEDS = [
     "/series/",
     "/movies/",
     "/category/anime/",
@@ -243,6 +251,44 @@ CATEGORY_SEEDS = [
     "/category/subbed/",
     "/category/ongoing/",
     "/category/completed/",
+    # Networks
+    "/category/network/cartoon-network/",
+    "/category/network/disney-channel/",
+    "/category/network/disney-plus/",
+    "/category/network/nickelodeon/",
+    "/category/network/netflix/",
+    "/category/network/amazon-prime/",
+    "/category/network/hulu/",
+    "/category/network/crunchyroll/",
+    "/category/network/funimation/",
+    "/category/network/toonami/",
+    "/category/network/pogo/",
+    "/category/network/sony-yay/",
+    "/category/network/hungama-tv/",
+    "/category/network/vh1/",
+    "/category/network/zee-tv/",
+    "/category/network/star-plus/",
+    "/category/network/colors-tv/",
+    "/category/network/hbo/",
+    "/category/network/hbo-max/",
+    "/category/network/adult-swim/",
+    "/category/network/boomerang/",
+    "/category/network/bbc/",
+    "/category/network/fox/",
+    "/category/network/paramount/",
+    # Languages
+    "/category/language/hindi/",
+    "/category/language/english/",
+    "/category/language/japanese/",
+    "/category/language/tamil/",
+    "/category/language/telugu/",
+    "/category/language/bengali/",
+    "/category/language/malayalam/",
+    "/category/language/kannada/",
+    "/category/language/marathi/",
+    "/category/language/gujarati/",
+    "/category/language/punjabi/",
+    # Genres
     "/genre/action/",
     "/genre/adventure/",
     "/genre/comedy/",
@@ -282,6 +328,8 @@ CATEGORY_SEEDS = [
     "/genre/samurai/",
     "/genre/police/",
     "/genre/dementia/",
+    "/genre/animation/",
+    "/genre/family/",
 ]
 
 
@@ -313,47 +361,102 @@ def guess_content_urls(title: str, content_type: str) -> list[str]:
     return urls
 
 
-def discover_extra_seeds(homepage_html: Optional[str]) -> list[str]:
+def autodiscover_taxonomy_seeds(homepage_html: Optional[str]) -> list[str]:
+    """
+    Auto-discover all category/genre/network/language slugs
+    by parsing the homepage and every nav/menu link on the site.
+    Returns a list of path strings (with trailing slash).
+    """
     seeds: list[str] = []
     if not homepage_html:
         return seeds
     s = soup(homepage_html)
     for a in s.select("a[href]"):
-        href = str(a.get("href", ""))
-        parsed = urlparse(href)
-        if parsed.netloc and parsed.netloc.rstrip("www.") not in ("animesalt.ac", ""):
+        href = str(a.get("href", "")).strip()
+        try:
+            parsed = urlparse(href)
+        except Exception:
+            continue
+        # Only same-domain links
+        if parsed.netloc and "animesalt.ac" not in parsed.netloc:
             continue
         path = parsed.path
-        if re.match(r"^/(category|genre|tag)/[^/]+/?$", path):
-            seeds.append(path if path.endswith("/") else path + "/")
+        if re.match(r"^/(category|genre|tag)/[^/]+(/[^/]+)?/?$", path):
+            clean = path if path.endswith("/") else path + "/"
+            seeds.append(clean)
     return list(dict.fromkeys(seeds))
 
 
-def crawl_listing(path: str) -> list[str]:
-    found = []
+def crawl_listing(path_or_url: str) -> list[str]:
+    """
+    Crawl a listing page (with optional query string) through all pagination.
+    Returns deduplicated list of /series/ and /movies/ URLs found.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    # Determine base URL and existing query params
+    if path_or_url.startswith("http"):
+        base_listing_url = path_or_url
+    else:
+        base_listing_url = urljoin(BASE_URL, path_or_url)
+
+    parsed_base = urlparse(base_listing_url)
+    base_qs = parsed_base.query  # e.g. "type=movies"
+
     page = 1
     while True:
-        url = urljoin(BASE_URL, path if page == 1 else f"{path.rstrip('/')}/page/{page}/")
-        html = fetch(url)
+        # Build paginated URL: insert /page/N/ before query string
+        path = parsed_base.path.rstrip("/")
+        if page == 1:
+            page_path = parsed_base.path
+        else:
+            page_path = f"{path}/page/{page}/"
+
+        page_url = urlunparse((
+            parsed_base.scheme,
+            parsed_base.netloc,
+            page_path,
+            "",
+            base_qs,
+            ""
+        ))
+
+        html = fetch(page_url)
         if not html:
             break
+
         s = soup(html)
         links = s.select("a[href]")
         page_found = []
         for a in links:
-            href = a["href"]
-            if classify_url(href) in ("series", "movie"):
-                page_found.append(href)
+            href = str(a.get("href", ""))
+            ct = classify_url(href)
+            if ct in ("series", "movie"):
+                clean = canonical_content_url(href)
+                if clean not in seen:
+                    seen.add(clean)
+                    page_found.append(clean)
+
         if not page_found:
             break
+
         found.extend(page_found)
-        log.info(f"  Listing {url}: found {len(page_found)} items (total {len(found)})")
-        nxt = s.select_one("a.next, a[rel=next], .nav-previous a")
+        log.info(f"  Listing {page_url}: found {len(page_found)} items (total {len(found)})")
+
+        # Check for next page
+        nxt = s.select_one("a.next, a[rel=next], .nav-previous a, .pagination a[href*='page']")
         if not nxt:
-            break
+            # Also check if there's a page N+1 link in pagination
+            page_links = s.select(".pagination a[href], .page-numbers a[href]")
+            has_next_page = any(f"/page/{page+1}/" in str(a.get("href", "")) for a in page_links)
+            if not has_next_page:
+                break
+
         page += 1
         if page > 500:
             break
+
     return list(dict.fromkeys(found))
 
 
@@ -373,6 +476,7 @@ def parse_content_page(url: str, content_type: str) -> Optional[dict]:
         title = title_tag["content"].strip() if title_tag else url.split("/")[-2]
     title = re.sub(r"\s*[-|]\s*Anime Salt.*$", "", title, flags=re.IGNORECASE).strip()
     title = re.sub(r"\s*[-|]\s*Watch Now.*$", "", title, flags=re.IGNORECASE).strip()
+    title = re.sub(r"\s*[-|]\s*AnimeSalt.*$", "", title, flags=re.IGNORECASE).strip()
 
     desc_tag = s.find("meta", attrs={"name": "description"})
     og_desc  = s.find("meta", property="og:description")
@@ -482,6 +586,15 @@ def parse_content_page(url: str, content_type: str) -> Optional[dict]:
     languages = list(dict.fromkeys(languages))
     primary_language = languages[0] if languages else "Japanese"
 
+    # Detect networks/studios from page
+    networks = []
+    network_links = s.select("a[href*='/category/network/'], .network a, [class*='network'] a")
+    for a in network_links:
+        n = a.get_text(strip=True)
+        if n and len(n) < 60:
+            networks.append(n)
+    networks = list(dict.fromkeys(networks))
+
     episodes = []
     if content_type == "series":
         episodes = parse_episode_list(s, url)
@@ -519,6 +632,7 @@ def parse_content_page(url: str, content_type: str) -> Optional[dict]:
         "featured": False,
         "_genres": genres,
         "_languages": languages,
+        "_networks": networks,
         "_episodes": episodes,
         "_source_url": url,
         "_slug": slug,
@@ -527,27 +641,51 @@ def parse_content_page(url: str, content_type: str) -> Optional[dict]:
 
 def parse_episode_list(s: BeautifulSoup, series_url: str) -> list[dict]:
     episodes = []
+    seen_keys: set[tuple] = set()
+
     for ep_link in s.select("a[href*='/episode/']"):
         href = ep_link.get("href", "")
         if not href:
             continue
         ep_text = ep_link.get_text(strip=True)
+
         s_num, e_num = 1, 1
+        # Try SxEx or S01E01 patterns
         m = re.search(r"[Ss](?:eason)?\s*(\d+)[Ee](?:p(?:isode)?)?\s*(\d+)", ep_text or href)
         if m:
             s_num, e_num = int(m.group(1)), int(m.group(2))
         else:
-            m2 = re.search(r"[Ee](?:p(?:isode)?)?\s*(\d+)", ep_text or href)
+            # Try "1x12" pattern
+            m2 = re.search(r"(\d+)x(\d+)", ep_text or href)
             if m2:
-                e_num = int(m2.group(1))
-        episodes.append({
-            "season_number": s_num,
-            "episode_number": e_num,
-            "title": ep_text or f"Episode {e_num}",
-            "url": href,
-            "thumbnail_url": None,
-            "duration_seconds": None,
-        })
+                s_num, e_num = int(m2.group(1)), int(m2.group(2))
+            else:
+                m3 = re.search(r"[Ee](?:p(?:isode)?)?\s*(\d+)", ep_text or href)
+                if m3:
+                    e_num = int(m3.group(1))
+                else:
+                    # Try extracting episode number from slug
+                    slug_part = href.rstrip("/").split("/")[-1]
+                    m4 = re.search(r"-(\d+)x(\d+)$", slug_part)
+                    if m4:
+                        s_num, e_num = int(m4.group(1)), int(m4.group(2))
+                    else:
+                        m5 = re.search(r"-ep?-?(\d+)$", slug_part, re.IGNORECASE)
+                        if m5:
+                            e_num = int(m5.group(1))
+
+        key = (s_num, e_num)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            episodes.append({
+                "season_number": s_num,
+                "episode_number": e_num,
+                "title": ep_text or f"Episode {e_num}",
+                "url": href,
+                "thumbnail_url": None,
+                "duration_seconds": None,
+            })
+
     episodes.sort(key=lambda e: (e["season_number"], e["episode_number"]))
     return episodes
 
@@ -558,15 +696,32 @@ def parse_episode_page(url: str) -> dict:
         return {}
     s = soup(html)
     video_servers = []
+
+    # Direct iframes
     for iframe in s.select("iframe[src], iframe[data-src]"):
         src = iframe.get("src") or iframe.get("data-src") or ""
+        src = src.strip()
         if src and src.startswith("http"):
             video_servers.append({
-                "server_name": "EMBED",
+                "server_name": urlparse(src).netloc or "EMBED",
                 "stream_url": src,
                 "quality": "1080p",
                 "language": "Japanese",
             })
+
+    # Also look for JS-embedded sources
+    for script in s.select("script"):
+        script_text = script.get_text()
+        for src_match in re.finditer(r"(?:file|src|source)\s*:\s*['\"]?(https?://[^'\">\s,]+)", script_text):
+            src = src_match.group(1)
+            if src not in {v["stream_url"] for v in video_servers}:
+                video_servers.append({
+                    "server_name": urlparse(src).netloc or "EMBED",
+                    "stream_url": src,
+                    "quality": "1080p",
+                    "language": "Japanese",
+                })
+
     thumb_el = s.select_one(".episode-thumbnail img, .thumb img, .episode-image img")
     thumb = extract_image(thumb_el)
     og_img = s.find("meta", property="og:image")
@@ -576,6 +731,7 @@ def parse_episode_page(url: str) -> dict:
     title = title_el.get_text(strip=True) if title_el else None
     if title:
         title = re.sub(r"\s*[-|]\s*Anime Salt.*$", "", title, flags=re.IGNORECASE).strip()
+        title = re.sub(r"\s*[-|]\s*AnimeSalt.*$", "", title, flags=re.IGNORECASE).strip()
     return {"thumbnail_url": thumbnail_url, "title": title, "video_servers": video_servers}
 
 
@@ -607,6 +763,7 @@ def find_content_by_title(db: Client, title: str) -> Optional[dict]:
 def upsert_content(db: Client, data: dict) -> Optional[str]:
     genres    = data.pop("_genres", [])
     data.pop("_languages", None)
+    data.pop("_networks", None)
     data.pop("_episodes", None)
     data.pop("_source_url", None)
     data.pop("_slug", None)
@@ -859,6 +1016,38 @@ def process_content(db: Client, url: str, content_type: str):
             upsert_video_servers(db, ep_id, ep_data.get("video_servers", []))
 
 
+def build_all_seeds(homepage_html: Optional[str]) -> list[str]:
+    """
+    Build the full list of listing URLs to crawl (as full URLs with optional query strings).
+    For every category/genre/network/language seed we crawl:
+      1. The base page (series by default)
+      2. The same page with ?type=movies
+    This ensures we don't miss movies-only content in any category.
+    """
+    # Start from hand-curated list + auto-discovered from homepage
+    auto_seeds = autodiscover_taxonomy_seeds(homepage_html)
+    all_paths = list(dict.fromkeys(BASE_CATEGORY_SEEDS + auto_seeds))
+
+    full_urls: list[str] = []
+    seen_urls: set[str] = set()
+
+    for path in all_paths:
+        base = urljoin(BASE_URL, path)
+        # Normal (series/all)
+        if base not in seen_urls:
+            seen_urls.add(base)
+            full_urls.append(base)
+        # With ?type=movies — useful for network/language/category pages
+        # Skip for /series/ and /movies/ themselves (already specific)
+        if not path.rstrip("/").endswith(("/series", "/movies")):
+            movies_url = base.rstrip("/") + "/" + "?type=movies"
+            if movies_url not in seen_urls:
+                seen_urls.add(movies_url)
+                full_urls.append(movies_url)
+
+    return full_urls
+
+
 def run(progress_hook=None, new_title_hook=None):
     """
     progress_hook(current, total, title, url, status) — called after EVERY item.
@@ -890,17 +1079,19 @@ def run(progress_hook=None, new_title_hook=None):
     fix_bad_images(db)
 
     # Step 2: Discover all content
-    con_head("STEP 2 — Discovering ALL content (sitemap + every category/genre page)")
+    con_head("STEP 2 — Discovering ALL content (sitemap + every category/network/language/genre page)")
 
     existing_set: set[str] = set()
     content_urls: list[tuple[str, str]] = []
 
     def add_url(u: str):
-        ct = classify_url(u)
-        if ct in ("series", "movie") and u not in existing_set:
-            existing_set.add(u)
-            content_urls.append((u, ct))
+        clean = canonical_content_url(u)
+        ct = classify_url(clean)
+        if ct in ("series", "movie") and clean not in existing_set:
+            existing_set.add(clean)
+            content_urls.append((clean, ct))
 
+    # 2a: Sitemap
     con_ok("Reading XML sitemap index…")
     all_sitemap_urls = get_sitemap_urls(SITEMAP_INDEX)
     before = len(content_urls)
@@ -908,32 +1099,32 @@ def run(progress_hook=None, new_title_hook=None):
         add_url(u)
     con_ok(f"Sitemap: {len(all_sitemap_urls)} total URLs → {len(content_urls) - before} content pages added")
 
-    con_ok("Scanning homepage for extra category/genre pages…")
+    # 2b: Homepage auto-discovery + all seeds
+    con_ok("Scanning homepage for extra category/genre/network/language pages…")
     homepage_html = fetch(BASE_URL)
-    homepage_seeds = discover_extra_seeds(homepage_html)
-    all_seeds = list(dict.fromkeys(CATEGORY_SEEDS + homepage_seeds))
-    con_ok(f"Will crawl {len(all_seeds)} listing pages")
+    all_seed_urls = build_all_seeds(homepage_html)
+    con_ok(f"Will crawl {len(all_seed_urls)} listing pages (including ?type=movies variants)")
 
-    for i, seed in enumerate(all_seeds, 1):
+    for i, seed_url in enumerate(all_seed_urls, 1):
         try:
-            extra = crawl_listing(seed)
+            extra = crawl_listing(seed_url)
             before = len(content_urls)
             for u in extra:
                 add_url(u)
             added = len(content_urls) - before
+            label = seed_url.replace(BASE_URL, "")
             if added:
-                con_new(f"  [{i}/{len(all_seeds)}] {seed} → +{added} new URLs ({len(content_urls)} total)")
+                con_new(f"  [{i}/{len(all_seed_urls)}] {label} → +{added} new URLs ({len(content_urls)} total)")
             else:
-                con_skip(f"  [{i}/{len(all_seeds)}] {seed} → 0 new")
+                con_skip(f"  [{i}/{len(all_seed_urls)}] {label} → 0 new")
         except Exception as e:
-            con_warn(f"  [{i}/{len(all_seeds)}] {seed} crawl error: {e}")
+            con_warn(f"  [{i}/{len(all_seed_urls)}] {seed_url} crawl error: {e}")
 
     series_count = sum(1 for _, ct in content_urls if ct == "series")
     movie_count  = sum(1 for _, ct in content_urls if ct == "movie")
     total_discovered = len(content_urls)
     con_ok(f"TOTAL to scrape: {total_discovered} unique titles ({series_count} series · {movie_count} movies)")
 
-    # Notify about discovered totals
     if progress_hook:
         progress_hook(0, total_discovered, "Discovery complete", "", "discovered")
 
@@ -949,19 +1140,15 @@ def run(progress_hook=None, new_title_hook=None):
             process_content(db, url, ct)
             print(flush=True)
 
-            # Detect new title and fire hook immediately
             if STATS.content_new > before_new:
                 actual_title = title_slug
                 ep_count = STATS.episodes_new - before_ep
                 if new_title_hook:
                     new_title_hook(actual_title, ct, ep_count)
                 status = "new"
-            elif STATS.content_updated > (before_new - STATS.content_new + STATS.content_updated - 1 if False else 0):
-                status = "updated"
             else:
                 status = "updated/skipped"
 
-            # Progress hook on EVERY item
             if progress_hook:
                 progress_hook(i, total_discovered, title_slug, url, status)
 
