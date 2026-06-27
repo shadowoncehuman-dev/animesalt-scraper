@@ -12,7 +12,7 @@ from typing import Optional
 from datetime import datetime, timezone
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, InputMediaPhoto
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -126,6 +126,22 @@ async def _send_with_media(msg_or_chat, text: str, kb=None, gif_list: list = Non
         await bot.send_message(chat_id=chat_id, text=text, **kwargs)
     else:
         await msg_or_chat.reply_text(text, **kwargs)
+
+
+async def _edit_msg(q, text: str, kb=None):
+    """Edit a message regardless of whether it's text, photo, or animation."""
+    kwargs = {"parse_mode": ParseMode.HTML, "reply_markup": kb}
+    try:
+        await q.edit_message_text(text, **kwargs)
+        return
+    except Exception:
+        pass
+    try:
+        await q.edit_message_caption(caption=text, **kwargs)
+        return
+    except Exception:
+        pass
+    await q.message.reply_text(text, **kwargs)
 
 
 # ── Database helpers ───────────────────────────────────────────────────────────
@@ -797,7 +813,12 @@ async def _send_user_management(msg, u: dict, edit: bool = True):
         try:
             await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
-        except BadRequest:
+        except Exception:
+            pass
+        try:
+            await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        except Exception:
             pass
     await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -839,7 +860,12 @@ async def _send_admin_panel(msg, edit: bool = True):
         try:
             await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
-        except BadRequest:
+        except Exception:
+            pass
+        try:
+            await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        except Exception:
             pass
     await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -878,7 +904,11 @@ async def _send_recently_added(msg, edit: bool = True):
     if edit:
         try:
             await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb); return
-        except BadRequest:
+        except Exception:
+            pass
+        try:
+            await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb); return
+        except Exception:
             pass
     await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -931,7 +961,11 @@ async def _send_anime_list(msg, page: int, ctype: str, sort: str = "title",
     if edit:
         try:
             await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb); return
-        except BadRequest:
+        except Exception:
+            pass
+        try:
+            await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb); return
+        except Exception:
             pass
     await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -948,7 +982,11 @@ async def _run_search(msg, query: str, edit: bool = False):
         if edit:
             try:
                 await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb); return
-            except BadRequest:
+            except Exception:
+                pass
+            try:
+                await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb); return
+            except Exception:
                 pass
         await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
@@ -964,7 +1002,11 @@ async def _run_search(msg, query: str, edit: bool = False):
     if edit:
         try:
             await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb); return
-        except BadRequest:
+        except Exception:
+            pass
+        try:
+            await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb); return
+        except Exception:
             pass
     await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -984,15 +1026,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── User requests access ──────────────────────────────────────────────────
     if data == "user:request":
         if not d:
-            await q.edit_message_text("⚠️ System unavailable, try later.")
+            await _edit_msg(q, "⚠️ System unavailable, try later.")
             return
         u = q.from_user
         _upsert_user(d, uid, u.username or "", u.first_name or "", requested=True)
-        await q.edit_message_text(
+        await _edit_msg(
+            q,
             f"🙋 <b>Request Sent!</b>\n\n"
             f"Hi <b>{u.first_name}</b>, your access request has been submitted!\n\n"
-            "You'll receive a notification once an admin reviews it. ✨",
-            parse_mode=ParseMode.HTML
+            "You'll receive a notification once an admin reviews it. ✨"
         )
         for aid in ADMIN_IDS:
             try:
@@ -1021,7 +1063,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if data.startswith("admin:ok:"):
             if d:
                 d.table("bot_users").update({"allowed": True, "requested": False}).eq("telegram_id", str(target)).execute()
-            await q.edit_message_text(f"✅ User <code>{target}</code> approved.", parse_mode=ParseMode.HTML)
+            await _edit_msg(q, f"✅ User <code>{target}</code> approved.")
             try:
                 gif = _neko_gif(_GIF_APPROVE)
                 msg_text = "🎉 <b>Access Granted!</b>\n\nWelcome to Senpai TV! 🎌\nUse /anime to start browsing."
@@ -1034,7 +1076,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             if d:
                 d.table("bot_users").update({"requested": False}).eq("telegram_id", str(target)).execute()
-            await q.edit_message_text(f"❌ Request from <code>{target}</code> denied.", parse_mode=ParseMode.HTML)
+            await _edit_msg(q, f"❌ Request from <code>{target}</code> denied.")
         return
 
     # ── Admin: block user ─────────────────────────────────────────────────────
@@ -1074,8 +1116,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("⛔", show_alert=True); return
         pending = _pending_users(d) if d else []
         if not pending:
-            await q.edit_message_text("✅ No pending requests.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="admin:panel")]]))
+            await _edit_msg(q, "✅ No pending requests.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="admin:panel")]]))
             return
         rows = []
         for u in pending:
@@ -1089,7 +1131,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = f"🔔 <b>Pending Requests ({len(pending)})</b>\n\n"
         for u in pending:
             text += f"• <b>{u.get('first_name','?')}</b> @{u.get('username','none')} — <code>{u['telegram_id']}</code>\n"
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+        await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("admin:users:"):
@@ -1117,8 +1159,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("◀️ Back", callback_data="admin:panel")])
-        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
-                                  reply_markup=InlineKeyboardMarkup(rows))
+        await _edit_msg(q, "\n".join(lines), InlineKeyboardMarkup(rows))
         return
 
     # ── Grant/revoke watch via inline ─────────────────────────────────────────
@@ -1154,10 +1195,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if uid not in ADMIN_IDS:
             await q.answer("⛔", show_alert=True); return
         ctx.user_data["broadcasting"] = True
-        await q.edit_message_text(
+        await _edit_msg(q,
             "📣 <b>Broadcast Message</b>\n\nType your message to send to all approved users:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardMarkup([[
                 InlineKeyboardButton("✖️ Cancel", callback_data="admin:panel")
             ]])
         )
@@ -1176,8 +1216,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"👥 Users:        <b>{s.get('users', 0):,}</b>"
         )
         back = "admin:panel" if uid in ADMIN_IDS else "anime:pg:1:all:title"
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data=back)]]))
+        await _edit_msg(q, text,
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data=back)]]))
         return
 
     # ── Scraper status ────────────────────────────────────────────────────────
@@ -1192,7 +1232,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔄 Refresh", callback_data="show:scraper"),
             InlineKeyboardButton("◀️ Admin", callback_data="admin:panel"),
         ]])
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await _edit_msg(q, text, kb)
         return
 
     # ── Recently added ────────────────────────────────────────────────────────
@@ -1209,10 +1249,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if uid not in ADMIN_IDS and (not u_obj or not u_obj.get("allowed")):
             await q.answer("🔒 Access required.", show_alert=True); return
         ctx.user_data["searching"] = True
-        await q.edit_message_text(
+        await _edit_msg(q,
             "🔍 <b>Search Anime</b>\n\nType the title you're looking for:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardMarkup([[
                 InlineKeyboardButton("✖️ Cancel", callback_data="anime:pg:1:all:title")
             ]])
         )
@@ -1259,19 +1298,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         poster = c.get("poster_url") or c.get("thumbnail_url") or ""
         if poster and poster.startswith("http"):
             try:
-                await q.message.reply_photo(photo=poster, caption=text,
-                                            parse_mode=ParseMode.HTML, reply_markup=kb)
-                try:
-                    await q.message.delete()
-                except Exception:
-                    pass
+                await q.edit_message_media(
+                    media=InputMediaPhoto(media=poster, caption=text, parse_mode=ParseMode.HTML),
+                    reply_markup=kb
+                )
                 return
             except Exception:
                 pass
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        except BadRequest:
-            await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await _edit_msg(q, text, kb)
         return
 
     # ── Episodes list ─────────────────────────────────────────────────────────
@@ -1315,10 +1349,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"anime:view:{cid}")])
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-        except BadRequest:
-            await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+        await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         return
 
     # ── Episode servers ───────────────────────────────────────────────────────
@@ -1355,10 +1386,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ep_page = seasons.index(ep["season_number"])
 
         rows.append([InlineKeyboardButton("◀️ Back to Episodes", callback_data=f"anime:eps:{cid}:{ep_page}")])
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-        except BadRequest:
-            await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+        await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         return
 
     # ── Movie watch ───────────────────────────────────────────────────────────
@@ -1385,10 +1413,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             text = f"⚠️ No stream available for <b>{c['title'] if c else 'this movie'}</b>."
         rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"anime:view:{cid}")])
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-        except BadRequest:
-            await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+        await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         return
 
     log.debug(f"Unhandled callback: {data}")
