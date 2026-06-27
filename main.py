@@ -571,6 +571,15 @@ def _scraper_loop():
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"[senpai-tv] Starting on port {PORT}", flush=True)
+
+    # Start Telegram bot in background thread
+    try:
+        from bot import start_bot
+        start_bot()
+        print("[senpai-tv] Telegram bot started", flush=True)
+    except Exception as _bot_err:
+        print(f"[senpai-tv] Bot startup skipped: {_bot_err}", flush=True)
+
     threading.Thread(target=_scraper_loop, name="scraper", daemon=False).start()
     try:
         srv = HTTPServer(("0.0.0.0", PORT), _Handler)
