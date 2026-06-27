@@ -14,7 +14,7 @@ import random
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs, urlencode
+from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs
 from typing import Optional
 
 import requests
@@ -102,7 +102,7 @@ EXCLUDE_PATH_PATTERNS = [
 EXCLUDE_FILENAME_PATTERNS = [
     "favicon", "watermark",
 ]
-REQUEST_DELAY  = (1.5, 3.0)
+REQUEST_DELAY  = (1.0, 2.5)
 MAX_RETRIES    = 3
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -141,8 +141,8 @@ def fetch(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
             r = session.get(url, timeout=25)
             if r.status_code == 200:
                 return r.text
-            elif r.status_code == 404:
-                log.warning(f"404 {url}")
+            elif r.status_code in (404, 410):
+                log.warning(f"HTTP {r.status_code} {url}")
                 return None
             else:
                 log.warning(f"HTTP {r.status_code} {url} (attempt {attempt+1})")
@@ -205,8 +205,11 @@ def classify_url(url: str) -> Optional[str]:
     p = urlparse(url).path
     if p.startswith("/series/"):
         return "series"
-    if p.startswith("/movies/"):
-        return "movie"
+    if p.startswith("/movies/") and len(p.strip("/").split("/")) >= 2:
+        # /movies/ is the listing, /movies/slug/ is a movie
+        parts = p.strip("/").split("/")
+        if len(parts) >= 2 and parts[1]:
+            return "movie"
     if p.startswith("/episode/"):
         return "episode"
     return None
@@ -240,7 +243,6 @@ def get_sitemap_urls(sitemap_url: str) -> list[str]:
 
 
 # ── Category seed list ────────────────────────────────────────────────────────
-# Base category seeds — every entry is crawled once for series AND once with ?type=movies
 BASE_CATEGORY_SEEDS = [
     "/series/",
     "/movies/",
@@ -251,10 +253,15 @@ BASE_CATEGORY_SEEDS = [
     "/category/subbed/",
     "/category/ongoing/",
     "/category/completed/",
+    "/category/new-release/",
+    "/category/popular/",
+    "/category/trending/",
+    "/category/top-rated/",
     # Networks
     "/category/network/cartoon-network/",
     "/category/network/disney-channel/",
     "/category/network/disney-plus/",
+    "/category/network/disney-xd/",
     "/category/network/nickelodeon/",
     "/category/network/netflix/",
     "/category/network/amazon-prime/",
@@ -276,6 +283,20 @@ BASE_CATEGORY_SEEDS = [
     "/category/network/bbc/",
     "/category/network/fox/",
     "/category/network/paramount/",
+    "/category/network/marvel/",
+    "/category/network/dc/",
+    "/category/network/studio-ghibli/",
+    "/category/network/ufotable/",
+    "/category/network/mappa/",
+    "/category/network/wit-studio/",
+    "/category/network/bones/",
+    "/category/network/a-1-pictures/",
+    "/category/network/sunrise/",
+    "/category/network/toei-animation/",
+    "/category/network/madhouse/",
+    "/category/network/j-c-staff/",
+    "/category/network/shaft/",
+    "/category/network/kyoto-animation/",
     # Languages
     "/category/language/hindi/",
     "/category/language/english/",
@@ -288,6 +309,8 @@ BASE_CATEGORY_SEEDS = [
     "/category/language/marathi/",
     "/category/language/gujarati/",
     "/category/language/punjabi/",
+    "/category/language/dubbed/",
+    "/category/language/subbed/",
     # Genres
     "/genre/action/",
     "/genre/adventure/",
@@ -330,6 +353,9 @@ BASE_CATEGORY_SEEDS = [
     "/genre/dementia/",
     "/genre/animation/",
     "/genre/family/",
+    "/genre/short/",
+    "/genre/josei/",
+    "/genre/seinen/",
 ]
 
 
@@ -377,7 +403,6 @@ def autodiscover_taxonomy_seeds(homepage_html: Optional[str]) -> list[str]:
             parsed = urlparse(href)
         except Exception:
             continue
-        # Only same-domain links
         if parsed.netloc and "animesalt.ac" not in parsed.netloc:
             continue
         path = parsed.path
@@ -387,26 +412,67 @@ def autodiscover_taxonomy_seeds(homepage_html: Optional[str]) -> list[str]:
     return list(dict.fromkeys(seeds))
 
 
-def crawl_listing(path_or_url: str) -> list[str]:
+def _extract_content_links(s: BeautifulSoup) -> list[str]:
+    """Extract all /series/ and /movies/<slug>/ links from a parsed page."""
+    found = []
+    for a in s.select("a[href]"):
+        href = str(a.get("href", ""))
+        ct = classify_url(href)
+        if ct in ("series", "movie"):
+            clean = canonical_content_url(href)
+            found.append(clean)
+    return found
+
+
+def _has_next_page(s: BeautifulSoup, current_page: int) -> bool:
+    """Check various pagination patterns for a next page."""
+    # Direct next links
+    nxt = s.select_one(
+        "a.next, a[rel=next], .nav-links a.next, "
+        ".navigation a.next, .pagination a.next, "
+        ".page-numbers a.next, a.nextpostslink"
+    )
+    if nxt:
+        return True
+
+    # Check for explicit page N+1 number in pagination
+    next_page_num = str(current_page + 1)
+    for a in s.select(".page-numbers a, .pagination a, nav a"):
+        href = a.get("href", "")
+        txt = a.get_text(strip=True)
+        if f"/page/{next_page_num}/" in href or txt == next_page_num:
+            return True
+
+    # Check for WordPress standard pagination
+    for a in s.select("a[href*='page']"):
+        href = a.get("href", "")
+        if f"/page/{next_page_num}/" in href or f"paged={next_page_num}" in href:
+            return True
+
+    return False
+
+
+def crawl_listing(path_or_url: str, max_pages: int = 1000) -> list[str]:
     """
-    Crawl a listing page (with optional query string) through all pagination.
-    Returns deduplicated list of /series/ and /movies/ URLs found.
+    Crawl a listing page through ALL pagination pages.
+    Stops only when a page returns no content links at all.
+    Returns deduplicated list of /series/ and /movies/<slug>/ URLs found.
     """
     found: list[str] = []
     seen: set[str] = set()
 
-    # Determine base URL and existing query params
     if path_or_url.startswith("http"):
         base_listing_url = path_or_url
     else:
         base_listing_url = urljoin(BASE_URL, path_or_url)
 
     parsed_base = urlparse(base_listing_url)
-    base_qs = parsed_base.query  # e.g. "type=movies"
+    base_qs = parsed_base.query
 
-    page = 1
-    while True:
-        # Build paginated URL: insert /page/N/ before query string
+    consecutive_empty = 0
+
+    for page in range(1, max_pages + 1):
+        # Build paginated URL
         path = parsed_base.path.rstrip("/")
         if page == 1:
             page_path = parsed_base.path
@@ -424,38 +490,54 @@ def crawl_listing(path_or_url: str) -> list[str]:
 
         html = fetch(page_url)
         if not html:
+            # 404 or network error — stop paginating
             break
 
         s = soup(html)
-        links = s.select("a[href]")
+
+        # Check for "no results" / "nothing found" indicators
+        no_results = s.select_one(
+            ".no-results, .nothing-found, .not-found, "
+            "[class*='no-result'], [class*='nothing-found']"
+        )
+        if no_results and page > 1:
+            break
+
+        page_links = _extract_content_links(s)
         page_found = []
-        for a in links:
-            href = str(a.get("href", ""))
-            ct = classify_url(href)
-            if ct in ("series", "movie"):
-                clean = canonical_content_url(href)
-                if clean not in seen:
-                    seen.add(clean)
-                    page_found.append(clean)
+        for clean in page_links:
+            if clean not in seen:
+                seen.add(clean)
+                page_found.append(clean)
 
         if not page_found:
-            break
-
-        found.extend(page_found)
-        log.info(f"  Listing {page_url}: found {len(page_found)} items (total {len(found)})")
-
-        # Check for next page
-        nxt = s.select_one("a.next, a[rel=next], .nav-previous a, .pagination a[href*='page']")
-        if not nxt:
-            # Also check if there's a page N+1 link in pagination
-            page_links = s.select(".pagination a[href], .page-numbers a[href]")
-            has_next_page = any(f"/page/{page+1}/" in str(a.get("href", "")) for a in page_links)
-            if not has_next_page:
+            consecutive_empty += 1
+            if consecutive_empty >= 2 or page > 1:
+                # Two consecutive empty pages or first page was empty
                 break
+            # Give it one more try for page 1 (could be first-page oddity)
+        else:
+            consecutive_empty = 0
+            found.extend(page_found)
+            log.info(f"  [{page_url}] page {page}: +{len(page_found)} (total {len(found)})")
 
-        page += 1
-        if page > 500:
+        # Check if there's a next page via explicit next link
+        has_next = _has_next_page(s, page)
+
+        # If page had content but no explicit next, still try page+1 proactively
+        # We'll stop when we get an empty page. Only bail early if page is completely empty.
+        if not has_next and not page_found:
             break
+
+        # Safety: if WordPress 404s, the HTML may still return 200 with a redirect
+        # Check for canonical URL that differs from what we requested
+        canonical_tag = s.find("link", rel="canonical")
+        if canonical_tag and page > 1:
+            canon = canonical_tag.get("href", "")
+            if f"/page/{page}/" not in canon and f"paged={page}" not in canon:
+                # Page redirected to base — no more pages
+                if not page_found:
+                    break
 
     return list(dict.fromkeys(found))
 
@@ -467,20 +549,27 @@ def parse_content_page(url: str, content_type: str) -> Optional[dict]:
         return None
     s = soup(html)
 
-    title = (
-        (s.find("h1") or s.find("h2"))
-        and (s.find("h1") or s.find("h2")).get_text(strip=True)
-    )
+    title = None
+    h1 = s.find("h1")
+    h2 = s.find("h2")
+    if h1:
+        title = h1.get_text(strip=True)
+    elif h2:
+        title = h2.get_text(strip=True)
     if not title:
         title_tag = s.find("meta", property="og:title")
         title = title_tag["content"].strip() if title_tag else url.split("/")[-2]
     title = re.sub(r"\s*[-|]\s*Anime Salt.*$", "", title, flags=re.IGNORECASE).strip()
     title = re.sub(r"\s*[-|]\s*Watch Now.*$", "", title, flags=re.IGNORECASE).strip()
     title = re.sub(r"\s*[-|]\s*AnimeSalt.*$", "", title, flags=re.IGNORECASE).strip()
+    title = re.sub(r"\s*\|\s*Watch.*$", "", title, flags=re.IGNORECASE).strip()
 
     desc_tag = s.find("meta", attrs={"name": "description"})
     og_desc  = s.find("meta", property="og:description")
-    overview_el = s.select_one(".overview, .description, .sinopse, [class*='overview'], [class*='sinopse']")
+    overview_el = s.select_one(
+        ".overview, .description, .sinopse, .entry-content p, "
+        "[class*='overview'], [class*='sinopse'], [class*='description']"
+    )
     description = None
     if overview_el:
         description = overview_el.get_text(separator=" ", strip=True)
@@ -488,6 +577,8 @@ def parse_content_page(url: str, content_type: str) -> Optional[dict]:
         description = og_desc["content"].strip()
     elif desc_tag and desc_tag.get("content"):
         description = desc_tag["content"].strip()
+    if description and len(description) > 2000:
+        description = description[:2000]
 
     og_img = s.find("meta", property="og:image")
     og_img_url = normalize_url(og_img["content"].strip()) if og_img and og_img.get("content") else None
@@ -586,7 +677,6 @@ def parse_content_page(url: str, content_type: str) -> Optional[dict]:
     languages = list(dict.fromkeys(languages))
     primary_language = languages[0] if languages else "Japanese"
 
-    # Detect networks/studios from page
     networks = []
     network_links = s.select("a[href*='/category/network/'], .network a, [class*='network'] a")
     for a in network_links:
@@ -650,12 +740,10 @@ def parse_episode_list(s: BeautifulSoup, series_url: str) -> list[dict]:
         ep_text = ep_link.get_text(strip=True)
 
         s_num, e_num = 1, 1
-        # Try SxEx or S01E01 patterns
         m = re.search(r"[Ss](?:eason)?\s*(\d+)[Ee](?:p(?:isode)?)?\s*(\d+)", ep_text or href)
         if m:
             s_num, e_num = int(m.group(1)), int(m.group(2))
         else:
-            # Try "1x12" pattern
             m2 = re.search(r"(\d+)x(\d+)", ep_text or href)
             if m2:
                 s_num, e_num = int(m2.group(1)), int(m2.group(2))
@@ -664,7 +752,6 @@ def parse_episode_list(s: BeautifulSoup, series_url: str) -> list[dict]:
                 if m3:
                     e_num = int(m3.group(1))
                 else:
-                    # Try extracting episode number from slug
                     slug_part = href.rstrip("/").split("/")[-1]
                     m4 = re.search(r"-(\d+)x(\d+)$", slug_part)
                     if m4:
@@ -697,7 +784,6 @@ def parse_episode_page(url: str) -> dict:
     s = soup(html)
     video_servers = []
 
-    # Direct iframes
     for iframe in s.select("iframe[src], iframe[data-src]"):
         src = iframe.get("src") or iframe.get("data-src") or ""
         src = src.strip()
@@ -709,7 +795,6 @@ def parse_episode_page(url: str) -> dict:
                 "language": "Japanese",
             })
 
-    # Also look for JS-embedded sources
     for script in s.select("script"):
         script_text = script.get_text()
         for src_match in re.finditer(r"(?:file|src|source)\s*:\s*['\"]?(https?://[^'\">\s,]+)", script_text):
@@ -799,7 +884,6 @@ def upsert_content(db: Client, data: dict) -> Optional[str]:
             poster_ok = "🖼" if data.get("poster_url") and not is_logo(data.get("poster_url", "")) else "❌"
             con_new(f"[NEW] {title} | thumb:{thumb_ok} poster:{poster_ok} | {data.get('type','?')} {data.get('release_year','')}".strip(), indent=1)
 
-        # Link genres
         for g_name in genres:
             g_id = get_or_create_genre(db, g_name)
             if g_id:
@@ -1018,13 +1102,12 @@ def process_content(db: Client, url: str, content_type: str):
 
 def build_all_seeds(homepage_html: Optional[str]) -> list[str]:
     """
-    Build the full list of listing URLs to crawl (as full URLs with optional query strings).
+    Build the full list of listing URLs to crawl.
     For every category/genre/network/language seed we crawl:
       1. The base page (series by default)
       2. The same page with ?type=movies
     This ensures we don't miss movies-only content in any category.
     """
-    # Start from hand-curated list + auto-discovered from homepage
     auto_seeds = autodiscover_taxonomy_seeds(homepage_html)
     all_paths = list(dict.fromkeys(BASE_CATEGORY_SEEDS + auto_seeds))
 
@@ -1033,14 +1116,13 @@ def build_all_seeds(homepage_html: Optional[str]) -> list[str]:
 
     for path in all_paths:
         base = urljoin(BASE_URL, path)
-        # Normal (series/all)
         if base not in seen_urls:
             seen_urls.add(base)
             full_urls.append(base)
-        # With ?type=movies — useful for network/language/category pages
-        # Skip for /series/ and /movies/ themselves (already specific)
+        # Also try ?type=movies variant for category/network/language pages
+        # (not for /series/ or /movies/ themselves)
         if not path.rstrip("/").endswith(("/series", "/movies")):
-            movies_url = base.rstrip("/") + "/" + "?type=movies"
+            movies_url = base.rstrip("/") + "/?type=movies"
             if movies_url not in seen_urls:
                 seen_urls.add(movies_url)
                 full_urls.append(movies_url)
