@@ -1505,6 +1505,19 @@ async def _bot_async():
     """Run the bot using manual async lifecycle (no signal handlers — safe in threads)."""
     app = build_app()
     await app.initialize()
+    # Force-claim the Telegram polling session from any stale previous connection.
+    # Calling getUpdates(timeout=0) immediately "steals" the session so the next
+    # real poll doesn't get a Conflict error.
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    for _attempt in range(8):
+        try:
+            await app.bot.get_updates(offset=-1, timeout=0, limit=1)
+            break
+        except Exception:
+            await asyncio.sleep(2)
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     log.info("[bot] Senpai TV bot is live and polling!")
@@ -1512,18 +1525,34 @@ async def _bot_async():
 
 
 def run_bot():
-    """Run bot in a dedicated thread with its own event loop."""
+    """Run bot in a dedicated thread with its own event loop.
+    Retries on Telegram Conflict errors (stale session from previous run)."""
     if not BOT_TOKEN:
         log.error("[bot] TELEGRAM_BOT_TOKEN not set — bot disabled.")
         return
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_bot_async())
-    except Exception as e:
-        log.error(f"[bot] crashed: {e}", exc_info=True)
-    finally:
-        loop.close()
+    from telegram.error import Conflict as TGConflict
+    attempt = 0
+    while True:
+        attempt += 1
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_bot_async())
+            break  # clean exit
+        except TGConflict:
+            wait = min(30, 5 * attempt)
+            log.warning(f"[bot] Conflict (attempt {attempt}) — retrying in {wait}s")
+            loop.close()
+            time.sleep(wait)
+        except Exception as e:
+            log.error(f"[bot] crashed: {e}", exc_info=True)
+            loop.close()
+            break
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
 
 def start_bot():
