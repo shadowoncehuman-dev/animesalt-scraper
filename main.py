@@ -4,10 +4,67 @@ Senpai TV — Content Scraper Service
 Run: python main.py
 """
 
-import os, sys, io, re, json, threading, time, traceback
+import os, sys, io, re, json, threading, time, traceback, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 from collections import deque
+
+SB_URL = os.environ.get("SUPABASE_URL", "")
+SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+
+def _sb():
+    if SB_URL and SB_KEY:
+        try:
+            from supabase import create_client
+            return create_client(SB_URL, SB_KEY)
+        except Exception:
+            pass
+    return None
+
+
+def _content_page_data(page: int = 1, ctype: str = "all", size: int = 24):
+    d = _sb()
+    if not d:
+        return [], 0
+    try:
+        offset = (page - 1) * size
+        q = d.table("content").select(
+            "id,title,type,release_year,rating,poster_url,language,status,created_at"
+        )
+        tq = d.table("content").select("id", count="exact", head=True)
+        if ctype and ctype != "all":
+            q = q.eq("type", ctype)
+            tq = tq.eq("type", ctype)
+        total = tq.execute().count or 0
+        items = q.order("created_at", desc=True).range(offset, offset + size - 1).execute().data or []
+        return items, total
+    except Exception:
+        return [], 0
+
+
+def _content_episodes(content_id: str):
+    d = _sb()
+    if not d:
+        return []
+    try:
+        return d.table("episodes").select(
+            "id,season_number,episode_number,title"
+        ).eq("content_id", content_id).order("season_number").order("episode_number").execute().data or []
+    except Exception:
+        return []
+
+
+def _episode_servers(ep_id: str):
+    d = _sb()
+    if not d:
+        return []
+    try:
+        return d.table("video_servers").select(
+            "server_name,stream_url,quality,language"
+        ).eq("episode_id", ep_id).execute().data or []
+    except Exception:
+        return []
 
 PORT           = int(os.environ.get("PORT", 5000))
 INTERVAL_HRS   = float(os.environ.get("SCRAPE_INTERVAL_HOURS", "6"))
@@ -440,10 +497,246 @@ def _html_esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_CONTENT_CSS = """
+:root{--bg:#080b10;--s1:#0d1117;--s2:#161b22;--s3:#1c2128;--border:#30363d;
+  --purple:#8b5cf6;--pink:#ec4899;--pl:#a78bfa;--green:#3fb950;--yellow:#d29922;
+  --red:#f85149;--blue:#58a6ff;--text:#c9d1d9;--muted:#6e7681;--white:#f0f6fc}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px}
+a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+header{background:var(--s1);border-bottom:1px solid var(--border);padding:12px 24px;
+  display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.logo{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--purple),var(--pink));
+  display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:900;color:#fff}
+.brand{font-size:16px;font-weight:700;color:var(--white)}
+.nav-links{display:flex;gap:12px;margin-left:16px}
+.nav-links a{font-size:13px;color:var(--muted);padding:4px 10px;border-radius:6px;border:1px solid transparent}
+.nav-links a:hover,.nav-links a.active{background:var(--s2);border-color:var(--border);color:var(--white);text-decoration:none}
+.hdr-r{margin-left:auto;font-size:12px;color:var(--muted)}
+.filters{display:flex;gap:10px;padding:16px 24px;border-bottom:1px solid var(--border);
+  background:var(--s1);flex-wrap:wrap;align-items:center}
+.filters select,.filters input{background:var(--s2);border:1px solid var(--border);color:var(--text);
+  padding:6px 12px;border-radius:6px;font-size:13px;outline:none}
+.filters select:focus,.filters input:focus{border-color:var(--purple)}
+.btn{display:inline-block;padding:6px 14px;border-radius:6px;border:1px solid var(--border);
+  background:var(--s2);color:var(--text);font-size:13px;cursor:pointer;text-decoration:none}
+.btn:hover{background:var(--s3);color:var(--white);text-decoration:none}
+.btn.primary{background:var(--purple);border-color:var(--purple);color:#fff}
+.btn.primary:hover{background:#7c3aed}
+.content-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+  gap:16px;padding:20px 24px}
+.card{background:var(--s1);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.card-top{display:flex;gap:12px;padding:14px}
+.poster{width:64px;height:90px;object-fit:cover;border-radius:6px;flex-shrink:0;background:var(--s3)}
+.poster-ph{width:64px;height:90px;border-radius:6px;flex-shrink:0;background:var(--s3);
+  display:flex;align-items:center;justify-content:center;font-size:24px}
+.card-info{flex:1;min-width:0}
+.card-title{font-size:14px;font-weight:700;color:var(--white);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px}
+.card-meta{font-size:11px;color:var(--muted);margin-bottom:6px}
+.badge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;margin-right:4px}
+.badge.series{background:rgba(139,92,246,.2);color:var(--pl)}
+.badge.movie{background:rgba(236,72,153,.2);color:var(--pink)}
+.badge.status{background:var(--s3);color:var(--muted)}
+.rating{color:var(--yellow);font-size:11px}
+.eps-toggle{width:100%;border:none;background:var(--s2);color:var(--text);padding:8px 14px;
+  text-align:left;font-size:12px;cursor:pointer;border-top:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center}
+.eps-toggle:hover{background:var(--s3);color:var(--white)}
+.eps-body{display:none;border-top:1px solid var(--border);background:var(--bg);max-height:400px;overflow-y:auto}
+.eps-body.open{display:block}
+.season-header{padding:8px 14px;font-size:11px;font-weight:700;color:var(--pl);
+  text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border);
+  background:var(--s3)}
+.ep-row{padding:8px 14px;border-bottom:1px solid rgba(48,54,61,.5);display:flex;
+  align-items:center;gap:10px;font-size:12px}
+.ep-row:last-child{border-bottom:none}
+.ep-row:hover{background:var(--s2)}
+.ep-num{color:var(--muted);flex-shrink:0;font-size:11px;width:36px}
+.ep-title{flex:1;color:var(--text);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srv-links{display:flex;gap:6px;flex-wrap:wrap}
+.srv-btn{font-size:10px;padding:3px 8px;border-radius:4px;background:rgba(63,185,80,.15);
+  color:var(--green);border:1px solid rgba(63,185,80,.3);text-decoration:none;white-space:nowrap}
+.srv-btn:hover{background:rgba(63,185,80,.3);text-decoration:none}
+.srv-btn.no-srv{color:var(--muted);background:var(--s3);border-color:var(--border);cursor:default}
+.pagination{display:flex;gap:8px;padding:20px 24px;justify-content:center;align-items:center;
+  border-top:1px solid var(--border)}
+.empty{text-align:center;padding:60px 24px;color:var(--muted);font-size:14px}
+.stats-bar{padding:10px 24px;background:var(--s1);border-bottom:1px solid var(--border);
+  font-size:12px;color:var(--muted);display:flex;gap:20px}
+.stats-bar span strong{color:var(--text)}
+"""
+
+
+def _build_content_html(page: int, ctype: str, search: str = "") -> bytes:
+    items, total = _content_page_data(page, ctype, size=24)
+    total_pages = max(1, -(-total // 24))  # ceil div
+
+    # Build content cards
+    cards_html = ""
+    for c in items:
+        cid     = c["id"]
+        title   = _html_esc(c.get("title") or "Untitled")
+        ctp     = c.get("type") or "series"
+        yr      = c.get("release_year") or ""
+        rating  = float(c.get("rating") or 0)
+        lang    = c.get("language") or ""
+        status  = (c.get("status") or "").title()
+        poster  = c.get("poster_url") or ""
+        added   = (c.get("created_at") or "")[:10]
+        icon    = "🎬" if ctp == "movie" else "📺"
+
+        if poster and poster.startswith("http"):
+            poster_html = f'<img class="poster" src="{poster}" alt="" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+            poster_html += f'<div class="poster-ph" style="display:none">{icon}</div>'
+        else:
+            poster_html = f'<div class="poster-ph">{icon}</div>'
+
+        meta_parts = []
+        if yr: meta_parts.append(str(yr))
+        if lang: meta_parts.append(lang)
+        if added: meta_parts.append(f"Added {added}")
+        meta_str = " · ".join(meta_parts)
+
+        stars = "★" * round(rating / 2) + "☆" * (5 - round(rating / 2)) if rating else ""
+        rating_html = f'<div class="rating">{stars} {rating:.1f}/10</div>' if rating else ""
+
+        cards_html += f"""
+<div class="card" id="card-{cid}">
+  <div class="card-top">
+    {poster_html}
+    <div class="card-info">
+      <div class="card-title" title="{title}">{title}</div>
+      <div class="card-meta">{meta_str}</div>
+      <div>
+        <span class="badge {ctp}">{ctp.upper()}</span>
+        {"<span class='badge status'>" + status + "</span>" if status else ""}
+      </div>
+      {rating_html}
+    </div>
+  </div>
+  <button class="eps-toggle" onclick="toggleEps('{cid}',this)">
+    <span>{"🎞 Episodes" if ctp == "series" else "▶ Watch"}</span>
+    <span class="arrow">▼</span>
+  </button>
+  <div class="eps-body" id="eps-{cid}">
+    <div style="padding:10px 14px;color:var(--muted);font-size:12px">Loading…</div>
+  </div>
+</div>"""
+
+    # Pagination
+    qs_base = f"?type={ctype}"
+    pag_html = ""
+    if page > 1:
+        pag_html += f'<a class="btn" href="/content{qs_base}&page={page-1}">◀ Prev</a>'
+    pag_html += f'<span style="color:var(--muted);font-size:13px">Page {page} / {total_pages} &nbsp;·&nbsp; {total:,} titles</span>'
+    if page < total_pages:
+        pag_html += f'<a class="btn" href="/content{qs_base}&page={page+1}">Next ▶</a>'
+
+    # Type filter tabs
+    def tab(label, value):
+        active = "active" if ctype == value else ""
+        return f'<a href="/content?type={value}&page=1" class="nav-links {active}">{label}</a>'
+
+    return (f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Senpai TV — Content Browser</title>
+<style>{_CONTENT_CSS}</style>
+</head><body>
+<header>
+  <div class="logo">S</div>
+  <div class="brand">Senpai TV</div>
+  <div class="nav-links">
+    <a href="/" class="{'active' if False else ''}">📊 Scraper</a>
+    <a href="/content?type=all" class="{'active' if True else ''}">🎌 Content</a>
+  </div>
+  <div class="hdr-r">{total:,} titles · {total_pages} pages</div>
+</header>
+<div class="filters">
+  <a href="/content?type=all&page=1" class="btn {'primary' if ctype=='all' else ''}">🌐 All</a>
+  <a href="/content?type=series&page=1" class="btn {'primary' if ctype=='series' else ''}">📺 Anime/Series</a>
+  <a href="/content?type=movie&page=1" class="btn {'primary' if ctype=='movie' else ''}">🎬 Movies</a>
+  <span style="margin-left:auto;color:var(--muted);font-size:12px">Sorted: newest first · Click any title to load episodes &amp; stream links</span>
+</div>
+<div class="stats-bar">
+  <span>Page <strong>{page}</strong> of <strong>{total_pages}</strong></span>
+  <span>Showing <strong>{len(items)}</strong> of <strong>{total:,}</strong> titles</span>
+  <span>Latest added on top</span>
+</div>
+{"<div class='content-grid'>" + cards_html + "</div>" if items else "<div class='empty'>No content found.</div>"}
+<div class="pagination">{pag_html}</div>
+<script>
+async function toggleEps(cid, btn) {{
+  const body = document.getElementById('eps-' + cid);
+  const isOpen = body.classList.contains('open');
+  if (isOpen) {{ body.classList.remove('open'); btn.querySelector('.arrow').textContent='▼'; return; }}
+  body.classList.add('open');
+  btn.querySelector('.arrow').textContent='▲';
+  if (body.dataset.loaded) return;
+  body.dataset.loaded = '1';
+  try {{
+    const r = await fetch('/api/episodes?content_id=' + cid);
+    const data = await r.json();
+    if (!data.seasons || !data.seasons.length) {{
+      body.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">No episodes found.</div>';
+      return;
+    }}
+    let html = '';
+    for (const [sn, eps] of data.seasons) {{
+      html += '<div class="season-header">Season ' + sn + ' — ' + eps.length + ' episodes</div>';
+      for (const ep of eps) {{
+        const srvHtml = ep.servers.length
+          ? ep.servers.map(s => '<a class="srv-btn" href="' + s.url + '" target="_blank" rel="noopener">' +
+              (s.name||'Play') + (s.quality?' · '+s.quality:'') + (s.lang?' · '+s.lang:'') + '</a>').join('')
+          : '<span class="srv-btn no-srv">No links</span>';
+        html += '<div class="ep-row"><span class="ep-num">E' + ep.num + '</span>' +
+          '<span class="ep-title">' + (ep.title||('Episode '+ep.num)) + '</span>' +
+          '<div class="srv-links">' + srvHtml + '</div></div>';
+      }}
+    }}
+    body.innerHTML = html;
+  }} catch(e) {{
+    body.innerHTML = '<div style="padding:12px 14px;color:var(--red);font-size:12px">Error loading episodes.</div>';
+  }}
+}}
+</script>
+</body></html>""").encode()
+
+
+def _api_episodes(content_id: str) -> bytes:
+    eps = _content_episodes(content_id)
+    seasons: dict = {}
+    for ep in eps:
+        sn = ep["season_number"]
+        seasons.setdefault(sn, []).append(ep)
+
+    result_seasons = []
+    for sn in sorted(seasons.keys()):
+        eps_list = []
+        for ep in seasons[sn]:
+            srvs = _episode_servers(ep["id"])
+            eps_list.append({
+                "id": ep["id"],
+                "num": ep["episode_number"],
+                "title": ep.get("title") or "",
+                "servers": [
+                    {"name": s.get("server_name",""), "url": s.get("stream_url",""),
+                     "quality": s.get("quality",""), "lang": s.get("language","")}
+                    for s in srvs if s.get("stream_url")
+                ]
+            })
+        result_seasons.append([sn, eps_list])
+
+    return json.dumps({"seasons": result_seasons}).encode()
+
+
 # ─── HTTP server ─────────────────────────────────────────────────────────────
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/status":
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path == "/status":
             with _lock:
                 body = json.dumps(
                     {k: v for k, v in STATE.items()
@@ -451,9 +744,22 @@ class _Handler(BaseHTTPRequestHandler):
                     default=str
                 ).encode()
             ct = "application/json"
+
+        elif parsed.path == "/content":
+            page  = int(qs.get("page",  ["1"])[0])
+            ctype = qs.get("type", ["all"])[0]
+            body  = _build_content_html(page, ctype)
+            ct    = "text/html; charset=utf-8"
+
+        elif parsed.path == "/api/episodes":
+            cid  = qs.get("content_id", [""])[0]
+            body = _api_episodes(cid) if cid else b'{"seasons":[]}'
+            ct   = "application/json"
+
         else:
             body = _build_html()
             ct = "text/html; charset=utf-8"
+
         self.send_response(200)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))
