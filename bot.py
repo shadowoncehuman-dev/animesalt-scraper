@@ -1477,8 +1477,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Bot startup ────────────────────────────────────────────────────────────────
+async def _error_handler(update, context) -> None:
+    """Suppress startup Conflict noise; log everything else."""
+    from telegram.error import Conflict
+    if isinstance(context.error, Conflict):
+        log.debug("[bot] startup Conflict suppressed — retrying poll automatically")
+        return
+    log.error("[bot] unhandled error: %s", context.error, exc_info=context.error)
+
+
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(_error_handler)
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CommandHandler("stats",      cmd_stats))
@@ -1501,58 +1511,22 @@ def build_app() -> Application:
     return app
 
 
-async def _bot_async():
-    """Run the bot using manual async lifecycle (no signal handlers — safe in threads)."""
-    app = build_app()
-    await app.initialize()
-    # Force-claim the Telegram polling session from any stale previous connection.
-    # Calling getUpdates(timeout=0) immediately "steals" the session so the next
-    # real poll doesn't get a Conflict error.
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    for _attempt in range(8):
-        try:
-            await app.bot.get_updates(offset=-1, timeout=0, limit=1)
-            break
-        except Exception:
-            await asyncio.sleep(2)
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    log.info("[bot] Senpai TV bot is live and polling!")
-    await asyncio.Event().wait()
-
-
 def run_bot():
-    """Run bot in a dedicated thread with its own event loop.
-    Retries on Telegram Conflict errors (stale session from previous run)."""
+    """Run the bot using Application.run_polling() which owns its own event loop.
+    stop_signals=() prevents signal-handler registration (not allowed in non-main threads).
+    run_polling() internally retries on Conflict and other transient errors."""
     if not BOT_TOKEN:
         log.error("[bot] TELEGRAM_BOT_TOKEN not set — bot disabled.")
         return
-    from telegram.error import Conflict as TGConflict
-    attempt = 0
-    while True:
-        attempt += 1
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(_bot_async())
-            break  # clean exit
-        except TGConflict:
-            wait = min(30, 5 * attempt)
-            log.warning(f"[bot] Conflict (attempt {attempt}) — retrying in {wait}s")
-            loop.close()
-            time.sleep(wait)
-        except Exception as e:
-            log.error(f"[bot] crashed: {e}", exc_info=True)
-            loop.close()
-            break
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
+    app = build_app()
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            stop_signals=(),         # safe for non-main threads
+            close_loop=True,
+        )
+    except Exception as e:
+        log.error(f"[bot] crashed: {e}", exc_info=True)
 
 
 def start_bot():
