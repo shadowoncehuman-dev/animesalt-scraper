@@ -988,23 +988,16 @@ def get_or_create_genre(db: Client, name: str) -> Optional[str]:
 
 def find_content_by_title_and_type(db: Client, title: str, content_type: str) -> Optional[dict]:
     """
-    Look up content by BOTH title and type to avoid collisions between
+    Look up content by BOTH title and type to prevent collisions between
     a movie and a series that share the same name (e.g. remakes, OVAs).
-    Falls back to title-only if no type-matched record exists.
+    Only returns a record if both title AND type match — no fallback to
+    title-only, which would incorrectly treat a different type as existing.
     """
     try:
-        # Prefer exact (title, type) match
         res = db.table("content").select(
             "id, title, type, poster_url, thumbnail_url, banner_url, description, release_year, language, status"
         ).eq("title", title).eq("type", content_type).execute()
-        if res.data:
-            return res.data[0]
-        # No same-type record — fall back to any record with this title
-        # (handles legacy data that was inserted before this fix)
-        res2 = db.table("content").select(
-            "id, title, type, poster_url, thumbnail_url, banner_url, description, release_year, language, status"
-        ).eq("title", title).execute()
-        return res2.data[0] if res2.data else None
+        return res.data[0] if res.data else None
     except Exception as e:
         log.warning(f"find_content error: {e}")
         return None

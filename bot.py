@@ -785,7 +785,8 @@ async def cmd_allow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_block(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Usage: /block <user_id>"); return
-    await _admin_set(update, ctx, ctx.args[0], allowed=False)
+    # Block always revokes both library and watch access
+    await _admin_set(update, ctx, ctx.args[0], allowed=False, can_watch=False)
 
 @admin_only
 async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
