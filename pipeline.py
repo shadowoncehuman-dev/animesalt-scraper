@@ -986,12 +986,25 @@ def get_or_create_genre(db: Client, name: str) -> Optional[str]:
         return None
 
 
-def find_content_by_title(db: Client, title: str) -> Optional[dict]:
+def find_content_by_title_and_type(db: Client, title: str, content_type: str) -> Optional[dict]:
+    """
+    Look up content by BOTH title and type to avoid collisions between
+    a movie and a series that share the same name (e.g. remakes, OVAs).
+    Falls back to title-only if no type-matched record exists.
+    """
     try:
+        # Prefer exact (title, type) match
         res = db.table("content").select(
-            "id, title, poster_url, thumbnail_url, banner_url, description, release_year, language, status"
+            "id, title, type, poster_url, thumbnail_url, banner_url, description, release_year, language, status"
+        ).eq("title", title).eq("type", content_type).execute()
+        if res.data:
+            return res.data[0]
+        # No same-type record — fall back to any record with this title
+        # (handles legacy data that was inserted before this fix)
+        res2 = db.table("content").select(
+            "id, title, type, poster_url, thumbnail_url, banner_url, description, release_year, language, status"
         ).eq("title", title).execute()
-        return res.data[0] if res.data else None
+        return res2.data[0] if res2.data else None
     except Exception as e:
         log.warning(f"find_content error: {e}")
         return None
@@ -1006,7 +1019,8 @@ def upsert_content(db: Client, data: dict) -> Optional[str]:
     data.pop("_slug", None)
 
     title = data.get("title", "?")
-    existing = find_content_by_title(db, title)
+    content_type = data.get("type", "series")
+    existing = find_content_by_title_and_type(db, title, content_type)
 
     try:
         if existing:
