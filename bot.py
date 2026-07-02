@@ -1173,7 +1173,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         else:
             if d:
-                d.table("bot_users").update({"requested": False}).eq("telegram_id", str(target)).execute()
+                # On deny: clear request flag and revoke any watch access
+                d.table("bot_users").update({"requested": False, "allowed": False, "can_watch": False}).eq("telegram_id", str(target)).execute()
             await _edit_msg(q, f"❌ Request from <code>{target}</code> denied.")
         return
 
@@ -1183,7 +1184,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("⛔", show_alert=True); return
         target = int(data.split(":", 2)[2])
         if d:
-            d.table("bot_users").update({"allowed": False}).eq("telegram_id", str(target)).execute()
+            # Revoke both library and watch access on block
+            d.table("bot_users").update({"allowed": False, "can_watch": False}).eq("telegram_id", str(target)).execute()
         await q.answer("🚫 User blocked.", show_alert=True)
         if d:
             u = _get_user(d, target)
@@ -1409,8 +1411,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Episodes list ─────────────────────────────────────────────────────────
     if data.startswith("anime:eps:"):
         u_obj = _get_user(d, uid) if d else None
+        if uid not in ADMIN_IDS and (not u_obj or not u_obj.get("allowed")):
+            await q.answer("🔒 Library access required.", show_alert=True); return
         if not _can_watch(uid, u_obj):
-            await q.answer("🔒 Watch access required.", show_alert=True); return
+            await q.answer("🔒 Watch access required. Ask admin to grant it.", show_alert=True); return
         parts = data.split(":")  # anime:eps:<cid>:<pg>
         cid, ep_page = parts[2], int(parts[3])
         c = _content_detail(d, cid) if d else None
@@ -1453,8 +1457,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Episode servers / video delivery ─────────────────────────────────────
     if data.startswith("anime:ep:"):
         u_obj = _get_user(d, uid) if d else None
+        if uid not in ADMIN_IDS and (not u_obj or not u_obj.get("allowed")):
+            await q.answer("🔒 Library access required.", show_alert=True); return
         if not _can_watch(uid, u_obj):
-            await q.answer("🔒 Watch access required.", show_alert=True); return
+            await q.answer("🔒 Watch access required. Ask admin to grant it.", show_alert=True); return
         parts = data.split(":")  # anime:ep:<ep_id>:<cid>
         ep_id, cid = parts[2], parts[3]
         ep = _ep_detail(d, ep_id) if d else None
@@ -1543,8 +1549,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Movie watch ───────────────────────────────────────────────────────────
     if data.startswith("anime:watch:"):
         u_obj = _get_user(d, uid) if d else None
+        if uid not in ADMIN_IDS and (not u_obj or not u_obj.get("allowed")):
+            await q.answer("🔒 Library access required.", show_alert=True); return
         if not _can_watch(uid, u_obj):
-            await q.answer("🔒 Watch access required.", show_alert=True); return
+            await q.answer("🔒 Watch access required. Ask admin to grant it.", show_alert=True); return
         cid = data[len("anime:watch:"):]
         c = _content_detail(d, cid) if d else None
         eps = _episodes(d, cid) if d else []
