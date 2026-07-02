@@ -785,43 +785,64 @@ def parse_episode_page(url: str) -> dict:
     video_servers: list[dict] = []
     seen_urls: set[str] = set()
 
-    # Domains to skip (analytics, ads, CDN assets — not video embeds)
-    _SKIP_DOMAINS = {
-        "google-analytics.com", "googlesyndication.com", "doubleclick.net",
-        "facebook.com", "twitter.com", "cloudflare.com", "jquery.com",
-        "bootstrapcdn.com", "fontawesome.com", "gravatar.com",
+    # Hard-block domains (analytics, ads, social) — never video
+    _BLOCK_DOMAINS = {
+        "google-analytics.com", "googlesyndication.com", "googletagmanager.com",
+        "doubleclick.net", "facebook.com", "twitter.com", "t.co",
+        "jquery.com", "bootstrapcdn.com", "fontawesome.com", "gravatar.com",
+        "disqus.com", "recaptcha.net", "cloudflare.com",
     }
-    _SKIP_EXTS = (".css", ".js", ".woff", ".woff2", ".ttf", ".svg", ".ico", ".png", ".jpg",
-                  ".gif", ".webp", ".map")
-    _VIDEO_KEYWORDS = ("embed", "player", "watch", "stream", "video", "episode",
-                       "m3u8", "mp4", "webm", ".mkv", "cdn", "jwplayer", "hls")
+    # Static asset extensions — never video
+    _STATIC_EXTS = (".css", ".js", ".woff", ".woff2", ".ttf", ".otf",
+                    ".svg", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".map")
+    # Known video CDN / embed host fragments — any URL with these is definitely video
+    _VIDEO_HOSTS = (
+        "streamtape", "doodstream", "dood.", "filemoon", "mixdrop", "fembed",
+        "upstream", "voe.sx", "mcloud", "vidcloud", "mycloud", "gostream",
+        "streamsb", "streamlare", "vidoza", "embed", "player.", "jwplayer",
+        "as-cdn", "short.icu", "hls.", "cdn.", "stream", "anime",
+    )
+    # Video URL keywords — used only for low-confidence contexts
+    _VIDEO_KEYWORDS = (
+        "embed", "player", "watch", "stream", "video", "episode",
+        ".m3u8", ".mp4", ".webm", ".mkv", "cdn", "jwplayer", "hls",
+    )
 
-    def _is_video_url(u: str) -> bool:
-        ul = u.lower()
-        # Must look like a video/embed URL
-        return any(kw in ul for kw in _VIDEO_KEYWORDS)
+    def _is_blocked(src: str) -> bool:
+        """True if URL should never be stored (analytics, static assets, etc.)."""
+        try:
+            domain = urlparse(src).netloc.lower()
+        except Exception:
+            return True
+        if any(bd in domain for bd in _BLOCK_DOMAINS):
+            return True
+        if any(src.lower().endswith(ext) for ext in _STATIC_EXTS):
+            return True
+        return False
 
-    def add_server(src: str, quality: str = "1080p", lang: str = "Japanese"):
+    def _looks_like_video(src: str) -> bool:
+        """True if URL has recognisable video/embed characteristics."""
+        sl = src.lower()
+        return any(kw in sl for kw in _VIDEO_KEYWORDS + _VIDEO_HOSTS)
+
+    def add_server(src: str, high_confidence: bool = False,
+                   quality: str = "1080p", lang: str = "Japanese"):
+        """
+        Add a stream URL to video_servers.
+        high_confidence=True  → accept any non-blocked HTTP URL (iframe, video/source, direct JS media)
+        high_confidence=False → also require _looks_like_video() (data-attrs, a[href])
+        """
         src = src.strip()
         if not src or src in seen_urls:
             return
         if not src.startswith("http"):
             return
-        try:
-            parsed = urlparse(src)
-            domain = parsed.netloc.lower()
-        except Exception:
+        if _is_blocked(src):
             return
-        # Skip non-video domains / static assets
-        if any(skip in domain for skip in _SKIP_DOMAINS):
-            return
-        if any(src.lower().endswith(ext) for ext in _SKIP_EXTS):
-            return
-        # Require the URL to look like a video/embed
-        if not _is_video_url(src):
+        if not high_confidence and not _looks_like_video(src):
             return
         seen_urls.add(src)
-        server_name = domain or "EMBED"
+        server_name = urlparse(src).netloc.lower() or "EMBED"
         video_servers.append({
             "server_name": server_name,
             "stream_url": src,
@@ -829,69 +850,76 @@ def parse_episode_page(url: str) -> dict:
             "language": lang,
         })
 
-    # ── 1. iframe elements (all lazy-load variants) ───────────────────────────
+    # ── 1. iframe elements (all lazy-load variants) ── high confidence ────────
     for iframe in s.select("iframe"):
         for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-url"):
             val = iframe.get(attr, "").strip()
             if val and val.startswith("http"):
-                add_server(val)
+                add_server(val, high_confidence=True)
                 break
 
-    # ── 2. Non-iframe elements with data-src/data-embed (lazy loaded) ─────────
+    # ── 2. Non-iframe elements with data-* (lazy loaded) ── low confidence ────
     for el in s.select("[data-src],[data-embed],[data-video],[data-url],[data-link],[data-player]"):
         if el.name in ("iframe", "img", "source", "script", "link"):
             continue
         for attr in ("data-src", "data-embed", "data-video", "data-url", "data-link", "data-player"):
             val = el.get(attr, "").strip()
-            if val and val.startswith("http") and _is_video_url(val):
-                add_server(val)
+            if val and val.startswith("http"):
+                add_server(val, high_confidence=False)  # keyword check applied
                 break
 
-    # ── 3. <video> and <source> elements ─────────────────────────────────────
+    # ── 3. <video> and <source> elements ── high confidence ───────────────────
     for el in s.select("video[src], source[src], video[data-src], source[data-src]"):
         for attr in ("src", "data-src"):
             val = el.get(attr, "").strip()
             if val and val.startswith("http"):
-                add_server(val)
+                add_server(val, high_confidence=True)
                 break
 
-    # ── 4. JavaScript patterns ────────────────────────────────────────────────
+    # ── 4. JavaScript patterns ─────────────────────────────────────────────────
     for script in s.select("script"):
         script_text = script.get_text()
         if not script_text.strip():
             continue
 
-        # Generic key: "url" / file: "url" patterns (handles jwplayer, videojs, etc.)
+        # Named video keys: file/src/source/url/embed/stream patterns
         for m in re.finditer(
-            r"""(?:file|src|source|url|link|embed|video_url|videoUrl|streamUrl|stream_url|hls)\s*[=:]\s*["'`](https?://[^"'`\s,\)\\]+)""",
+            r"""(?:file|src|source|url|link|embed|video_url|videoUrl|streamUrl|stream_url|hls)\s*[=:]\s*["'`](https?://[^"'`\s,\)\\]{8,})""",
             script_text, re.IGNORECASE
         ):
-            add_server(m.group(1))
+            # These are explicitly named as video-related → high confidence
+            add_server(m.group(1), high_confidence=True)
 
-        # sources array objects: {file: "..."} or {src: "..."}
-        for m in re.finditer(r"""["'](?:file|src)["']\s*:\s*["'](https?://[^"']+)["']""", script_text):
-            add_server(m.group(1))
+        # sources array: {file: "..."} or {src: "..."}
+        for m in re.finditer(r"""["'](?:file|src)["']\s*:\s*["'](https?://[^"']{8,})["']""", script_text):
+            add_server(m.group(1), high_confidence=True)
 
-        # jwplayer().setup({...file:...})
-        for m in re.finditer(r"""jwplayer\b[^;]*["']file["']\s*:\s*["'](https?://[^"']+)["']""",
-                              script_text, re.DOTALL):
-            add_server(m.group(1))
+        # jwplayer().setup() patterns
+        for m in re.finditer(
+            r"""jwplayer\b[^;]{0,500}["']file["']\s*:\s*["'](https?://[^"']+)["']""",
+            script_text, re.DOTALL
+        ):
+            add_server(m.group(1), high_confidence=True)
 
-        # Direct .m3u8 and .mp4 URLs anywhere in script
-        for m in re.finditer(r"""(https?://[^\s"'<>\\]+\.(?:m3u8|mp4|webm)[^\s"'<>\\]*)""",
-                              script_text, re.IGNORECASE):
-            add_server(m.group(1))
+        # Direct .m3u8 / .mp4 / .webm URLs anywhere in script (definitive media)
+        for m in re.finditer(
+            r"""(https?://[^\s"'<>\\]{8,}\.(?:m3u8|mp4|webm|mkv)[^\s"'<>\\]*)""",
+            script_text, re.IGNORECASE
+        ):
+            add_server(m.group(1), high_confidence=True)
 
-        # player.src("url") or player.load("url") patterns
-        for m in re.finditer(r"""player\s*\.\s*(?:src|source|load)\s*\(\s*["'`](https?://[^"'`\)]+)""",
-                              script_text, re.IGNORECASE):
-            add_server(m.group(1))
+        # player.src("url") patterns
+        for m in re.finditer(
+            r"""player\s*\.\s*(?:src|source|load)\s*\(\s*["'`](https?://[^"'`\)]{8,})""",
+            script_text, re.IGNORECASE
+        ):
+            add_server(m.group(1), high_confidence=True)
 
-    # ── 5. <a> links pointing directly at embeds/streams ─────────────────────
+    # ── 5. <a> links pointing directly at embeds/streams ── low confidence ────
     for a in s.select("a[href]"):
         href = a.get("href", "").strip()
-        if href.startswith("http") and _is_video_url(href):
-            add_server(href)
+        if href.startswith("http"):
+            add_server(href, high_confidence=False)  # keyword check applied
 
     # ── Thumbnail & title ─────────────────────────────────────────────────────
     thumb_el = s.select_one(
