@@ -782,32 +782,122 @@ def parse_episode_page(url: str) -> dict:
     if not html:
         return {}
     s = soup(html)
-    video_servers = []
+    video_servers: list[dict] = []
+    seen_urls: set[str] = set()
 
-    for iframe in s.select("iframe[src], iframe[data-src]"):
-        src = iframe.get("src") or iframe.get("data-src") or ""
+    # Domains to skip (analytics, ads, CDN assets — not video embeds)
+    _SKIP_DOMAINS = {
+        "google-analytics.com", "googlesyndication.com", "doubleclick.net",
+        "facebook.com", "twitter.com", "cloudflare.com", "jquery.com",
+        "bootstrapcdn.com", "fontawesome.com", "gravatar.com",
+    }
+    _SKIP_EXTS = (".css", ".js", ".woff", ".woff2", ".ttf", ".svg", ".ico", ".png", ".jpg",
+                  ".gif", ".webp", ".map")
+    _VIDEO_KEYWORDS = ("embed", "player", "watch", "stream", "video", "episode",
+                       "m3u8", "mp4", "webm", ".mkv", "cdn", "jwplayer", "hls")
+
+    def _is_video_url(u: str) -> bool:
+        ul = u.lower()
+        # Must look like a video/embed URL
+        return any(kw in ul for kw in _VIDEO_KEYWORDS)
+
+    def add_server(src: str, quality: str = "1080p", lang: str = "Japanese"):
         src = src.strip()
-        if src and src.startswith("http"):
-            video_servers.append({
-                "server_name": urlparse(src).netloc or "EMBED",
-                "stream_url": src,
-                "quality": "1080p",
-                "language": "Japanese",
-            })
+        if not src or src in seen_urls:
+            return
+        if not src.startswith("http"):
+            return
+        try:
+            parsed = urlparse(src)
+            domain = parsed.netloc.lower()
+        except Exception:
+            return
+        # Skip non-video domains / static assets
+        if any(skip in domain for skip in _SKIP_DOMAINS):
+            return
+        if any(src.lower().endswith(ext) for ext in _SKIP_EXTS):
+            return
+        # Require the URL to look like a video/embed
+        if not _is_video_url(src):
+            return
+        seen_urls.add(src)
+        server_name = domain or "EMBED"
+        video_servers.append({
+            "server_name": server_name,
+            "stream_url": src,
+            "quality": quality,
+            "language": lang,
+        })
 
+    # ── 1. iframe elements (all lazy-load variants) ───────────────────────────
+    for iframe in s.select("iframe"):
+        for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-url"):
+            val = iframe.get(attr, "").strip()
+            if val and val.startswith("http"):
+                add_server(val)
+                break
+
+    # ── 2. Non-iframe elements with data-src/data-embed (lazy loaded) ─────────
+    for el in s.select("[data-src],[data-embed],[data-video],[data-url],[data-link],[data-player]"):
+        if el.name in ("iframe", "img", "source", "script", "link"):
+            continue
+        for attr in ("data-src", "data-embed", "data-video", "data-url", "data-link", "data-player"):
+            val = el.get(attr, "").strip()
+            if val and val.startswith("http") and _is_video_url(val):
+                add_server(val)
+                break
+
+    # ── 3. <video> and <source> elements ─────────────────────────────────────
+    for el in s.select("video[src], source[src], video[data-src], source[data-src]"):
+        for attr in ("src", "data-src"):
+            val = el.get(attr, "").strip()
+            if val and val.startswith("http"):
+                add_server(val)
+                break
+
+    # ── 4. JavaScript patterns ────────────────────────────────────────────────
     for script in s.select("script"):
         script_text = script.get_text()
-        for src_match in re.finditer(r"(?:file|src|source)\s*:\s*['\"]?(https?://[^'\">\s,]+)", script_text):
-            src = src_match.group(1)
-            if src not in {v["stream_url"] for v in video_servers}:
-                video_servers.append({
-                    "server_name": urlparse(src).netloc or "EMBED",
-                    "stream_url": src,
-                    "quality": "1080p",
-                    "language": "Japanese",
-                })
+        if not script_text.strip():
+            continue
 
-    thumb_el = s.select_one(".episode-thumbnail img, .thumb img, .episode-image img")
+        # Generic key: "url" / file: "url" patterns (handles jwplayer, videojs, etc.)
+        for m in re.finditer(
+            r"""(?:file|src|source|url|link|embed|video_url|videoUrl|streamUrl|stream_url|hls)\s*[=:]\s*["'`](https?://[^"'`\s,\)\\]+)""",
+            script_text, re.IGNORECASE
+        ):
+            add_server(m.group(1))
+
+        # sources array objects: {file: "..."} or {src: "..."}
+        for m in re.finditer(r"""["'](?:file|src)["']\s*:\s*["'](https?://[^"']+)["']""", script_text):
+            add_server(m.group(1))
+
+        # jwplayer().setup({...file:...})
+        for m in re.finditer(r"""jwplayer\b[^;]*["']file["']\s*:\s*["'](https?://[^"']+)["']""",
+                              script_text, re.DOTALL):
+            add_server(m.group(1))
+
+        # Direct .m3u8 and .mp4 URLs anywhere in script
+        for m in re.finditer(r"""(https?://[^\s"'<>\\]+\.(?:m3u8|mp4|webm)[^\s"'<>\\]*)""",
+                              script_text, re.IGNORECASE):
+            add_server(m.group(1))
+
+        # player.src("url") or player.load("url") patterns
+        for m in re.finditer(r"""player\s*\.\s*(?:src|source|load)\s*\(\s*["'`](https?://[^"'`\)]+)""",
+                              script_text, re.IGNORECASE):
+            add_server(m.group(1))
+
+    # ── 5. <a> links pointing directly at embeds/streams ─────────────────────
+    for a in s.select("a[href]"):
+        href = a.get("href", "").strip()
+        if href.startswith("http") and _is_video_url(href):
+            add_server(href)
+
+    # ── Thumbnail & title ─────────────────────────────────────────────────────
+    thumb_el = s.select_one(
+        ".episode-thumbnail img, .thumb img, .episode-image img, "
+        ".wp-post-image, .featured-image img, article img"
+    )
     thumb = extract_image(thumb_el)
     og_img = s.find("meta", property="og:image")
     og = normalize_url(og_img["content"].strip()) if og_img and og_img.get("content") else None

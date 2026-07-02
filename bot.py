@@ -5,7 +5,7 @@ Anime database bot with admin user management, browsing, search,
 episode access, scraper status, broadcasts, and more.
 """
 
-import os, asyncio, logging, math, random, threading, time
+import os, re, asyncio, logging, math, random, threading, time
 import requests as _http
 from functools import wraps
 from typing import Optional
@@ -155,13 +155,18 @@ def _get_user(d: SBClient, tg_id: int) -> Optional[dict]:
     try:
         r = d.table("bot_users").select("*").eq("telegram_id", str(tg_id)).execute()
         return r.data[0] if r.data else None
-    except Exception:
+    except Exception as e:
+        if "PGRST205" in str(e):
+            log.error("bot_users table missing — run setup_db.sql in Supabase SQL editor")
         return None
 
 
 def _upsert_user(d: SBClient, tg_id: int, username: str, first_name: str, **kw):
     try:
         existing = _get_user(d, tg_id)
+        if existing is None and not _bot_users_exist(d):
+            log.error("bot_users table missing — user data cannot be saved")
+            return
         row = {"telegram_id": str(tg_id), "username": username or "", "first_name": first_name or "", **kw}
         if existing:
             d.table("bot_users").update(kw or row).eq("telegram_id", str(tg_id)).execute()
@@ -195,6 +200,15 @@ def _pending_users(d: SBClient) -> list:
         return []
 
 
+def _bot_users_exist(d: SBClient) -> bool:
+    """Return True if the bot_users table exists in the DB."""
+    try:
+        d.table("bot_users").select("telegram_id").limit(1).execute()
+        return True
+    except Exception as e:
+        return "PGRST205" not in str(e)  # PGRST205 = table not found
+
+
 def _db_stats(d: SBClient) -> dict:
     try:
         titles  = d.table("content").select("id", count="exact", head=True).execute().count or 0
@@ -202,8 +216,10 @@ def _db_stats(d: SBClient) -> dict:
         srvs    = d.table("video_servers").select("id", count="exact", head=True).execute().count or 0
         anime   = d.table("content").select("id", count="exact", head=True).eq("type", "series").execute().count or 0
         movies  = d.table("content").select("id", count="exact", head=True).eq("type", "movie").execute().count or 0
-        users   = d.table("bot_users").select("id", count="exact", head=True).execute().count or 0
-        allowed = d.table("bot_users").select("id", count="exact", head=True).eq("allowed", True).execute().count or 0
+        users, allowed = 0, 0
+        if _bot_users_exist(d):
+            users   = d.table("bot_users").select("id", count="exact", head=True).execute().count or 0
+            allowed = d.table("bot_users").select("id", count="exact", head=True).eq("allowed", True).execute().count or 0
         return {"titles": titles, "eps": eps, "servers": srvs, "anime": anime,
                 "movies": movies, "users": users, "allowed": allowed}
     except Exception:
@@ -1376,7 +1392,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if url:
                     rows.append([InlineKeyboardButton(lbl.strip(), url=url)])
         else:
-            text += "⚠️ No stream servers found for this episode."
+            text += (
+                "⚠️ <b>No stream servers stored for this episode.</b>\n\n"
+                "This usually means:\n"
+                "• The episode page had no embeds when last scraped\n"
+                "• The source site uses dynamic loading\n\n"
+                "🔗 You can watch directly on AnimeSalt:"
+            )
+            # Build a direct AnimeSalt URL guess from the show title
+            if show:
+                slug = re.sub(r"[^\w\s-]", "", show.lower()).strip()
+                slug = re.sub(r"[\s_]+", "-", slug).strip("-")
+                ep_num = ep.get("episode_number", 1) if ep else 1
+                direct_url = f"https://animesalt.ac/episode/{slug}-episode-{ep_num}/"
+                rows.append([InlineKeyboardButton("🌐 Watch on AnimeSalt", url=direct_url)])
 
         ep_page = 0
         if ep and d:
@@ -1398,10 +1427,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c = _content_detail(d, cid) if d else None
         eps = _episodes(d, cid) if d else []
         rows = []
+        movie_title = c["title"] if c else "Movie"
         if eps:
             ep = eps[0]
             srvs = _servers(d, ep["id"]) if d else []
-            text = f"🎬 <b>{c['title'] if c else 'Movie'}</b>\n\n"
+            text = f"🎬 <b>{movie_title}</b>\n\n"
             if srvs:
                 text += f"🖥️ <b>{len(srvs)} stream server(s):</b>"
                 for srv in srvs:
@@ -1409,9 +1439,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if srv.get("stream_url"):
                         rows.append([InlineKeyboardButton(lbl.strip(), url=srv["stream_url"])])
             else:
-                text += "⚠️ No stream servers found."
+                text += "⚠️ <b>No stream servers stored for this movie.</b>\n\n🔗 Watch directly on AnimeSalt:"
+                slug = re.sub(r"[^\w\s-]", "", movie_title.lower()).strip()
+                slug = re.sub(r"[\s_]+", "-", slug).strip("-")
+                rows.append([InlineKeyboardButton("🌐 Watch on AnimeSalt", url=f"https://animesalt.ac/movies/{slug}/")])
         else:
-            text = f"⚠️ No stream available for <b>{c['title'] if c else 'this movie'}</b>."
+            text = f"⚠️ No stream available for <b>{movie_title}</b>."
+            slug = re.sub(r"[^\w\s-]", "", movie_title.lower()).strip()
+            slug = re.sub(r"[\s_]+", "-", slug).strip("-")
+            rows.append([InlineKeyboardButton("🌐 Watch on AnimeSalt", url=f"https://animesalt.ac/movies/{slug}/")])
         rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"anime:view:{cid}")])
         await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         return
@@ -1511,6 +1547,40 @@ def build_app() -> Application:
     return app
 
 
+def _send_admin_startup_alert(bot_app, missing_tables: list[str]):
+    """Send a one-time setup alert to all admins if required tables are missing."""
+    if not missing_tables or not ADMIN_IDS:
+        return
+    msg = (
+        "⚠️ <b>Senpai TV — Setup Required</b>\n\n"
+        f"Missing database table(s): <code>{', '.join(missing_tables)}</code>\n\n"
+        "📋 <b>Fix:</b>\n"
+        "1. Go to <a href='https://supabase.com/dashboard'>Supabase Dashboard</a>\n"
+        "2. Open your project → <b>SQL Editor</b>\n"
+        "3. Copy and run the contents of <code>setup_db.sql</code>\n\n"
+        "The bot will work fully once those tables exist."
+    )
+    import asyncio
+
+    async def _alert():
+        for aid in ADMIN_IDS:
+            try:
+                await bot_app.bot.send_message(chat_id=aid, text=msg,
+                                               parse_mode="HTML",
+                                               disable_web_page_preview=True)
+            except Exception:
+                pass
+
+    try:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(bot_app.initialize())
+        loop.run_until_complete(_alert())
+        loop.run_until_complete(bot_app.shutdown())
+        loop.close()
+    except Exception:
+        pass
+
+
 def run_bot():
     """Run the bot using Application.run_polling() which owns its own event loop.
     stop_signals=() prevents signal-handler registration (not allowed in non-main threads).
@@ -1519,6 +1589,26 @@ def run_bot():
         log.error("[bot] TELEGRAM_BOT_TOKEN not set — bot disabled.")
         return
     app = build_app()
+
+    # Check for missing tables and alert admins once on startup
+    if SB_URL and SB_KEY:
+        d = None
+        try:
+            d = create_client(SB_URL, SB_KEY)
+        except Exception:
+            pass
+        if d:
+            missing: list[str] = []
+            for tbl in ["content", "episodes", "video_servers", "bot_users"]:
+                try:
+                    d.table(tbl).select("*").limit(1).execute()
+                except Exception as e:
+                    if "PGRST205" in str(e):
+                        missing.append(tbl)
+            if missing:
+                log.warning(f"[bot] Missing tables: {missing} — sending admin alert")
+                _send_admin_startup_alert(app, missing)
+
     try:
         app.run_polling(
             drop_pending_updates=True,
