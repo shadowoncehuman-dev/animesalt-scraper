@@ -45,4 +45,4 @@ timeoutMs = 60000
 [userenv]
 
 [userenv.shared]
-SCRAPE_INTERVAL_HOURS = "6"
+SCRAPE_INTERVAL_HOURS = "1"
