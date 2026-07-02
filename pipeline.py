@@ -786,32 +786,48 @@ def parse_episode_page(url: str) -> dict:
     seen_urls: set[str] = set()
 
     # Hard-block domains (analytics, ads, social) — never video
-    _BLOCK_DOMAINS = {
+    _BLOCK_DOMAINS = frozenset({
         "google-analytics.com", "googlesyndication.com", "googletagmanager.com",
         "doubleclick.net", "facebook.com", "twitter.com", "t.co",
         "jquery.com", "bootstrapcdn.com", "fontawesome.com", "gravatar.com",
         "disqus.com", "recaptcha.net", "cloudflare.com",
-    }
+    })
     # Static asset extensions — never video
     _STATIC_EXTS = (".css", ".js", ".woff", ".woff2", ".ttf", ".otf",
                     ".svg", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".map")
-    # Known video CDN / embed host fragments — any URL with these is definitely video
-    _VIDEO_HOSTS = (
-        "streamtape", "doodstream", "dood.", "filemoon", "mixdrop", "fembed",
-        "upstream", "voe.sx", "mcloud", "vidcloud", "mycloud", "gostream",
-        "streamsb", "streamlare", "vidoza", "embed", "player.", "jwplayer",
-        "as-cdn", "short.icu", "hls.", "cdn.", "stream", "anime",
-    )
-    # Video URL keywords — used only for low-confidence contexts
-    _VIDEO_KEYWORDS = (
-        "embed", "player", "watch", "stream", "video", "episode",
-        ".m3u8", ".mp4", ".webm", ".mkv", "cdn", "jwplayer", "hls",
-    )
+    # Known video/embed host domains (exact, without www.)
+    _EMBED_HOSTS = frozenset({
+        "streamtape.com", "streamtape.xyz", "streamtape.net",
+        "doodstream.com", "dood.watch", "dood.la", "dood.pm", "dood.to",
+        "filemoon.sx", "filemoon.to", "filemoon.in",
+        "mixdrop.co", "mixdrop.to", "mixdrop.gl",
+        "fembed.com", "fembed.net",
+        "upstream.to",
+        "voe.sx", "voe.bar",
+        "mcloud.to", "mcloud.bz",
+        "vidcloud.co", "vidcloud.pro",
+        "streamlare.com",
+        "vidoza.net",
+        "gostream.site",
+        "streamsb.net", "streamsb.com",
+        "as-cdn21.top", "as-cdn.top",  # seen in actual DB data
+        "short.icu",                    # seen in actual DB data
+        "embtaku.com", "embtaku.pro",
+        "gogoplay.io", "gogoanime.bid",
+        "mp4upload.com",
+        "4shared.com",
+    })
+    # Definitive media file extensions
+    _MEDIA_EXTS = (".m3u8", ".mp4", ".webm", ".mkv", ".ts", ".m4v")
+    # URL path segments that definitively indicate an embedded player
+    _EMBED_PATHS = ("/embed/", "/player/", "/e/", "/v/", "/play/",
+                    "player.php", "embed.php", "video.php",
+                    "do=getVideo", "do=embed", "do=playvideo")
 
     def _is_blocked(src: str) -> bool:
         """True if URL should never be stored (analytics, static assets, etc.)."""
         try:
-            domain = urlparse(src).netloc.lower()
+            domain = urlparse(src).netloc.lower().lstrip("www.")
         except Exception:
             return True
         if any(bd in domain for bd in _BLOCK_DOMAINS):
@@ -821,9 +837,27 @@ def parse_episode_page(url: str) -> dict:
         return False
 
     def _looks_like_video(src: str) -> bool:
-        """True if URL has recognisable video/embed characteristics."""
-        sl = src.lower()
-        return any(kw in sl for kw in _VIDEO_KEYWORDS + _VIDEO_HOSTS)
+        """
+        Strict check used for low-confidence contexts (data-attrs, a[href]).
+        Uses exact domain matching and specific path patterns — NOT broad substring checks.
+        """
+        try:
+            parsed = urlparse(src)
+            domain = parsed.netloc.lower().lstrip("www.")
+            path = parsed.path.lower()
+        except Exception:
+            return False
+        # Known embed host domains (exact match)
+        if domain in _EMBED_HOSTS:
+            return True
+        # Definitive media file extensions
+        src_l = src.lower()
+        if any(ext in src_l for ext in _MEDIA_EXTS):
+            return True
+        # Definitive embed path segments
+        if any(ep in path or ep in src_l for ep in _EMBED_PATHS):
+            return True
+        return False
 
     def add_server(src: str, high_confidence: bool = False,
                    quality: str = "1080p", lang: str = "Japanese"):
