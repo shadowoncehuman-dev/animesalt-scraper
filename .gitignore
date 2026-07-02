@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyc
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+scraper.log
+
+# Replit
+.replit
+replit.nix
+.upm/
+
+# Assets / attachments
+attached_assets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
