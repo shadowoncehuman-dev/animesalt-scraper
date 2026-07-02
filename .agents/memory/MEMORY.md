@@ -1,0 +1,3 @@
+- [Project setup](project-setup.md) — Senpai TV: Python scraper + Telegram bot. Packages must be pip-installed; they are not bundled.
+- [DB state](db-state.md) — All 6 Supabase tables exist and have data; no schema migration needed.
+- [Auth access model](auth-model.md) — Two-tier: allowed=browse library, can_watch=view episodes/stream. Block must revoke both.
