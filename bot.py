@@ -128,6 +128,53 @@ async def _send_with_media(msg_or_chat, text: str, kb=None, gif_list: list = Non
         await msg_or_chat.reply_text(text, **kwargs)
 
 
+async def _schedule_delete(bot, chat_id: int, message_id: int, delay_sec: int):
+    """Delete a message after `delay_sec` seconds — used for auto-expiring episode videos."""
+    if delay_sec <= 0:
+        return
+    try:
+        await asyncio.sleep(delay_sec)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        log.info(f"[auto-delete] Removed msg {message_id} in chat {chat_id}")
+    except Exception as e:
+        log.debug(f"[auto-delete] Could not delete msg {message_id}: {e}")
+
+
+async def _try_send_video_file(ctx, chat_id: int, video_url: str, caption: str,
+                                duration_sec: int = 0, thumbnail_url: str = None) -> bool:
+    """
+    Attempt to deliver a video directly in Telegram.
+    Only works for direct .mp4/.webm/.m4v URLs (not embed pages).
+    Sent with protect_content=True (prevents forwarding/saving).
+    Schedules auto-delete after duration_sec if provided.
+    Returns True on success.
+    """
+    url_l = video_url.lower().split("?")[0]
+    # Only attempt for direct media file URLs
+    is_direct = url_l.endswith(".mp4") or url_l.endswith(".webm") or url_l.endswith(".m4v")
+    if not is_direct:
+        return False
+    try:
+        msg = await ctx.bot.send_video(
+            chat_id=chat_id,
+            video=video_url,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            duration=duration_sec or None,
+            thumbnail=thumbnail_url or None,
+            protect_content=True,
+            supports_streaming=True,
+            read_timeout=60,
+            write_timeout=60,
+        )
+        if duration_sec and duration_sec > 0:
+            asyncio.create_task(_schedule_delete(ctx.bot, chat_id, msg.message_id, duration_sec))
+        return True
+    except Exception as e:
+        log.debug(f"Direct video send failed ({video_url[:60]}): {e}")
+        return False
+
+
 async def _edit_msg(q, text: str, kb=None):
     """Edit a message regardless of whether it's text, photo, or animation."""
     kwargs = {"parse_mode": ParseMode.HTML, "reply_markup": kb}
@@ -1042,16 +1089,50 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── User requests access ──────────────────────────────────────────────────
     if data == "user:request":
         if not d:
-            await _edit_msg(q, "⚠️ System unavailable, try later.")
+            await _edit_msg(q, "⚠️ Database unavailable. Please try again later or contact admin.")
             return
+        # Ensure bot_users table exists before trying to save request
+        if not _bot_users_exist(d):
+            await _edit_msg(
+                q,
+                "⚠️ <b>Setup Incomplete</b>\n\n"
+                "The admin needs to finish setting up the database.\n"
+                "Please contact the admin directly to get access.\n\n"
+                "🔧 Admin: run <code>setup_db.sql</code> in Supabase SQL Editor."
+            )
+            for aid in ADMIN_IDS:
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=aid,
+                        text=(
+                            "⚠️ <b>Access Request Failed — DB Setup Incomplete!</b>\n\n"
+                            f"User <b>{q.from_user.first_name}</b> (@{q.from_user.username or 'none'}) "
+                            f"tried to request access but <code>bot_users</code> table is missing.\n\n"
+                            "📋 Fix: run <code>setup_db.sql</code> in Supabase SQL Editor."
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+            return
+
         u = q.from_user
         _upsert_user(d, uid, u.username or "", u.first_name or "", requested=True)
-        await _edit_msg(
-            q,
+        gif = _neko_gif(["wave", "happy", "smile", "nod", "thumbsup"])
+        confirm_text = (
             f"🙋 <b>Request Sent!</b>\n\n"
-            f"Hi <b>{u.first_name}</b>, your access request has been submitted!\n\n"
-            "You'll receive a notification once an admin reviews it. ✨"
+            f"Hi <b>{u.first_name}</b>! Your access request has been submitted. ✨\n\n"
+            "You'll get a notification once an admin reviews it.\n"
+            "Usually approved within a few hours. 😊"
         )
+        if gif:
+            try:
+                await ctx.bot.send_animation(chat_id=uid, animation=gif,
+                                             caption=confirm_text, parse_mode=ParseMode.HTML)
+            except Exception:
+                await _edit_msg(q, confirm_text)
+        else:
+            await _edit_msg(q, confirm_text)
         for aid in ADMIN_IDS:
             try:
                 kb = InlineKeyboardMarkup([[
@@ -1061,9 +1142,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ]])
                 await ctx.bot.send_message(
                     chat_id=aid,
-                    text=(f"🔔 <b>New Access Request</b>\n\n"
+                    text=(f"🔔 <b>New Access Request!</b>\n\n"
                           f"👤 <b>{u.first_name}</b> (@{u.username or 'none'})\n"
-                          f"🆔 <code>{uid}</code>"),
+                          f"🆔 <code>{uid}</code>\n\n"
+                          f"Tap to approve or deny:"),
                     parse_mode=ParseMode.HTML, reply_markup=kb
                 )
             except Exception:
@@ -1368,7 +1450,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         return
 
-    # ── Episode servers ───────────────────────────────────────────────────────
+    # ── Episode servers / video delivery ─────────────────────────────────────
     if data.startswith("anime:ep:"):
         u_obj = _get_user(d, uid) if d else None
         if not _can_watch(uid, u_obj):
@@ -1381,31 +1463,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         show = c["title"] if c else ""
         ep_lbl = f"S{ep['season_number']}E{ep['episode_number']}" if ep else "Episode"
         ep_title = ep.get("title") or ep_lbl if ep else ep_lbl
-
-        text = f"▶️ <b>{show}</b>\n<b>{ep_lbl}</b>: {ep_title}\n\n"
-        rows = []
-        if srvs:
-            text += f"🖥️ <b>{len(srvs)} stream server(s):</b>"
-            for srv in srvs:
-                lbl = f"▶️ {srv.get('server_name','Server')} · {srv.get('quality','')} {srv.get('language','')}"
-                url = srv.get("stream_url", "")
-                if url:
-                    rows.append([InlineKeyboardButton(lbl.strip(), url=url)])
-        else:
-            text += (
-                "⚠️ <b>No stream servers stored for this episode.</b>\n\n"
-                "This usually means:\n"
-                "• The episode page had no embeds when last scraped\n"
-                "• The source site uses dynamic loading\n\n"
-                "🔗 You can watch directly on AnimeSalt:"
-            )
-            # Build a direct AnimeSalt URL guess from the show title
-            if show:
-                slug = re.sub(r"[^\w\s-]", "", show.lower()).strip()
-                slug = re.sub(r"[\s_]+", "-", slug).strip("-")
-                ep_num = ep.get("episode_number", 1) if ep else 1
-                direct_url = f"https://animesalt.ac/episode/{slug}-episode-{ep_num}/"
-                rows.append([InlineKeyboardButton("🌐 Watch on AnimeSalt", url=direct_url)])
+        duration_sec = int(ep.get("duration_seconds") or 0) if ep else 0
+        thumbnail = (c or {}).get("thumbnail_url") or (c or {}).get("poster_url") or None
 
         ep_page = 0
         if ep and d:
@@ -1414,8 +1473,71 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if ep["season_number"] in seasons:
                 ep_page = seasons.index(ep["season_number"])
 
-        rows.append([InlineKeyboardButton("◀️ Back to Episodes", callback_data=f"anime:eps:{cid}:{ep_page}")])
-        await _edit_msg(q, text, InlineKeyboardMarkup(rows))
+        back_row = [InlineKeyboardButton("◀️ Back to Episodes", callback_data=f"anime:eps:{cid}:{ep_page}")]
+
+        if srvs:
+            # ── Try direct video delivery first (for .mp4/.webm direct URLs) ──
+            caption = (
+                f"▶️ <b>{show}</b>  |  <b>{ep_lbl}</b>\n"
+                f"📋 {ep_title}"
+                + (f"\n⏱ {duration_sec // 60}m {duration_sec % 60}s" if duration_sec else "")
+                + "\n\n🔒 <i>Forwarding & saving disabled</i>"
+                + ("\n⏰ <i>This video will auto-delete after playback</i>" if duration_sec else "")
+            )
+            delivered = False
+            for srv in srvs:
+                url = srv.get("stream_url", "")
+                if url:
+                    delivered = await _try_send_video_file(
+                        ctx, uid, url, caption,
+                        duration_sec=duration_sec, thumbnail_url=thumbnail
+                    )
+                    if delivered:
+                        # Confirm delivery with a minimal edit
+                        try:
+                            await _edit_msg(
+                                q,
+                                f"▶️ <b>{show}</b> — <b>{ep_lbl}</b>\n\n"
+                                f"✅ Video sent! It will auto-delete after playback.\n"
+                                f"🔒 Forwarding is disabled.",
+                                InlineKeyboardMarkup([back_row])
+                            )
+                        except Exception:
+                            pass
+                        break
+
+            if not delivered:
+                # Fall back to stream buttons
+                text = f"▶️ <b>{show}</b>\n<b>{ep_lbl}</b>: {ep_title}\n\n"
+                text += f"🖥️ <b>{len(srvs)} stream server(s):</b>"
+                rows = []
+                for srv in srvs:
+                    lbl = f"▶️ {srv.get('server_name','Server')} · {srv.get('quality','')} {srv.get('language','')}".strip()
+                    url = srv.get("stream_url", "")
+                    if url:
+                        rows.append([InlineKeyboardButton(lbl, url=url)])
+                rows.append(back_row)
+                await _edit_msg(q, text, InlineKeyboardMarkup(rows))
+        else:
+            text = (
+                f"▶️ <b>{show}</b>\n<b>{ep_lbl}</b>: {ep_title}\n\n"
+                "⚠️ <b>No stream servers stored for this episode.</b>\n\n"
+                "This usually means:\n"
+                "• The episode page had no embeds when last scraped\n"
+                "• The source site uses dynamic loading\n\n"
+                "🔗 You can watch directly on AnimeSalt:"
+            )
+            rows = []
+            if show:
+                slug = re.sub(r"[^\w\s-]", "", show.lower()).strip()
+                slug = re.sub(r"[\s_]+", "-", slug).strip("-")
+                ep_num = ep.get("episode_number", 1) if ep else 1
+                rows.append([InlineKeyboardButton(
+                    "🌐 Watch on AnimeSalt",
+                    url=f"https://animesalt.ac/episode/{slug}-episode-{ep_num}/"
+                )])
+            rows.append(back_row)
+            await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         return
 
     # ── Movie watch ───────────────────────────────────────────────────────────
@@ -1428,28 +1550,63 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         eps = _episodes(d, cid) if d else []
         rows = []
         movie_title = c["title"] if c else "Movie"
+        thumbnail = (c or {}).get("thumbnail_url") or (c or {}).get("poster_url") or None
+        back_row = [InlineKeyboardButton("◀️ Back", callback_data=f"anime:view:{cid}")]
+
         if eps:
             ep = eps[0]
             srvs = _servers(d, ep["id"]) if d else []
-            text = f"🎬 <b>{movie_title}</b>\n\n"
+            duration_sec = int(ep.get("duration_seconds") or 0)
+
             if srvs:
-                text += f"🖥️ <b>{len(srvs)} stream server(s):</b>"
+                # Try direct video delivery first
+                caption = (
+                    f"🎬 <b>{movie_title}</b>\n\n"
+                    + (f"⏱ {duration_sec // 60}m {duration_sec % 60}s\n" if duration_sec else "")
+                    + "🔒 <i>Forwarding & saving disabled</i>"
+                    + ("\n⏰ <i>Auto-deletes after playback</i>" if duration_sec else "")
+                )
+                delivered = False
                 for srv in srvs:
-                    lbl = f"▶️ {srv.get('server_name','Server')} · {srv.get('quality','')} {srv.get('language','')}"
-                    if srv.get("stream_url"):
-                        rows.append([InlineKeyboardButton(lbl.strip(), url=srv["stream_url"])])
+                    url = srv.get("stream_url", "")
+                    if url:
+                        delivered = await _try_send_video_file(
+                            ctx, uid, url, caption,
+                            duration_sec=duration_sec, thumbnail_url=thumbnail
+                        )
+                        if delivered:
+                            try:
+                                await _edit_msg(
+                                    q,
+                                    f"🎬 <b>{movie_title}</b>\n\n✅ Movie sent! "
+                                    "It will auto-delete after playback.\n🔒 Forwarding is disabled.",
+                                    InlineKeyboardMarkup([back_row])
+                                )
+                            except Exception:
+                                pass
+                            break
+
+                if not delivered:
+                    text = f"🎬 <b>{movie_title}</b>\n\n🖥️ <b>{len(srvs)} stream server(s):</b>"
+                    for srv in srvs:
+                        lbl = f"▶️ {srv.get('server_name','Server')} · {srv.get('quality','')} {srv.get('language','')}".strip()
+                        if srv.get("stream_url"):
+                            rows.append([InlineKeyboardButton(lbl, url=srv["stream_url"])])
+                    rows.append(back_row)
+                    await _edit_msg(q, text, InlineKeyboardMarkup(rows))
             else:
-                text += "⚠️ <b>No stream servers stored for this movie.</b>\n\n🔗 Watch directly on AnimeSalt:"
+                text = f"🎬 <b>{movie_title}</b>\n\n⚠️ <b>No stream servers stored.</b>\n\n🔗 Watch directly on AnimeSalt:"
                 slug = re.sub(r"[^\w\s-]", "", movie_title.lower()).strip()
                 slug = re.sub(r"[\s_]+", "-", slug).strip("-")
                 rows.append([InlineKeyboardButton("🌐 Watch on AnimeSalt", url=f"https://animesalt.ac/movies/{slug}/")])
+                rows.append(back_row)
+                await _edit_msg(q, text, InlineKeyboardMarkup(rows))
         else:
-            text = f"⚠️ No stream available for <b>{movie_title}</b>."
             slug = re.sub(r"[^\w\s-]", "", movie_title.lower()).strip()
             slug = re.sub(r"[\s_]+", "-", slug).strip("-")
             rows.append([InlineKeyboardButton("🌐 Watch on AnimeSalt", url=f"https://animesalt.ac/movies/{slug}/")])
-        rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"anime:view:{cid}")])
-        await _edit_msg(q, text, InlineKeyboardMarkup(rows))
+            rows.append(back_row)
+            await _edit_msg(q, f"⚠️ No stream available for <b>{movie_title}</b>.", InlineKeyboardMarkup(rows))
         return
 
     log.debug(f"Unhandled callback: {data}")

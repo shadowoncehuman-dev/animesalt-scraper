@@ -800,8 +800,16 @@ def _scraper_loop():
 
         pipeline.STATS = pipeline.Stats()
 
-        # Telegram: cycle started
-        tg_start(cycle, 0, 0)
+        # Telegram: cycle started — read real DB counts first
+        _titles_count, _ep_count = 0, 0
+        try:
+            _d = _sb()
+            if _d:
+                _titles_count = _d.table("content").select("id", count="exact", head=True).execute().count or 0
+                _ep_count     = _d.table("episodes").select("id", count="exact", head=True).execute().count or 0
+        except Exception:
+            pass
+        tg_start(cycle, _titles_count, _ep_count)
 
         t0 = time.time()
 
